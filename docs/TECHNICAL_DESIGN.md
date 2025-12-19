@@ -201,10 +201,11 @@ fuzz_generator/
 ├── models/                     # 数据模型模块
 │   ├── __init__.py
 │   ├── function_info.py        # 函数信息模型
-│   ├── dataflow_info.py        # 数据流信息模型
 │   ├── xml_models.py           # XML DataModel模型
 │   ├── task.py                 # 分析任务模型
-│   └── analysis_result.py      # 分析结果模型
+│   └── analysis_result.py      # 分析结果模型（含数据流模型）
+# 注：dataflow_info.py 的内容已合并到 analysis_result.py 中，
+# 包括 DataFlowPath, DataFlowNode, ControlFlowInfo, CallGraphInfo 等类
 ├── storage/                    # 持久化存储模块
 │   ├── __init__.py
 │   ├── base.py                 # 存储接口定义

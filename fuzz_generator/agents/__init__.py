@@ -1,31 +1,38 @@
-"""Agents module for multi-agent collaboration.
+"""Agent module for multi-agent collaboration.
 
-This module provides the agent system for fuzz test data modeling:
-- BaseAgent: Abstract base class for all agents
-- CodeAnalyzerAgent: Analyzes function code structure and parameters
-- ContextBuilderAgent: Builds context via dataflow/controlflow analysis
-- ModelGeneratorAgent: Generates Secray XML DataModel
-- OrchestratorAgent: Coordinates the analysis workflow
+This module provides AutoGen-based agents for code analysis workflow:
+- CodeAnalyzer: Analyzes function code structure
+- ContextBuilder: Builds data flow and control flow context
+- ModelGenerator: Generates Secray XML DataModel
+- Orchestrator: Coordinates the analysis workflow
 """
 
-from fuzz_generator.agents.base import (
-    AgentConfig,
-    AgentResult,
-    BaseAgent,
-    PromptTemplate,
+from fuzz_generator.agents.autogen_agents import (
+    AnalysisWorkflowRunner,
+    AutoGenAgentFactory,
+    create_mcp_tools,
+    run_single_agent_analysis,
 )
+from fuzz_generator.agents.base import AgentConfig, AgentResult, BaseAgent, PromptTemplate
+
+# Legacy agents (for backwards compatibility)
 from fuzz_generator.agents.code_analyzer import CodeAnalyzerAgent
 from fuzz_generator.agents.context_builder import ContextBuilderAgent
 from fuzz_generator.agents.model_generator import ModelGeneratorAgent
 from fuzz_generator.agents.orchestrator import OrchestratorAgent
 
 __all__ = [
+    # AutoGen-based (new)
+    "AutoGenAgentFactory",
+    "AnalysisWorkflowRunner",
+    "create_mcp_tools",
+    "run_single_agent_analysis",
     # Base classes
     "BaseAgent",
     "AgentConfig",
     "AgentResult",
     "PromptTemplate",
-    # Specialized agents
+    # Legacy agents
     "CodeAnalyzerAgent",
     "ContextBuilderAgent",
     "ModelGeneratorAgent",

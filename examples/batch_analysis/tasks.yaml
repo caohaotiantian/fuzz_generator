@@ -1,0 +1,52 @@
+# Batch Analysis Tasks
+#
+# This file defines multiple analysis tasks for the RTSP server example.
+
+# Project path - relative to this file
+project_path: "./rtsp_server"
+
+# Batch description
+description: "RTSP Server batch analysis"
+
+# Analysis tasks
+tasks:
+  # Request handler
+  - source_file: "handler.c"
+    function_name: "handle_request"
+    output_name: "RTSPHandleRequest"
+    priority: 10
+
+  - source_file: "handler.c"
+    function_name: "handle_options"
+    output_name: "RTSPOptions"
+    priority: 5
+
+  # Parser functions
+  - source_file: "parser.c"
+    function_name: "parse_rtsp_request"
+    output_name: "RTSPRequestLine"
+    priority: 10
+
+  - source_file: "parser.c"
+    function_name: "parse_header_line"
+    output_name: "RTSPHeader"
+    priority: 8
+
+  # Session management
+  - source_file: "session.c"
+    function_name: "create_session"
+    output_name: "RTSPSessionCreate"
+    priority: 6
+
+  - source_file: "session.c"
+    function_name: "update_session_state"
+    output_name: "RTSPSessionUpdate"
+    priority: 4
+    depends_on:
+      - "4"  # Depends on create_session task
+
+  - source_file: "session.c"
+    function_name: "destroy_session"
+    output_name: "RTSPSessionDestroy"
+    priority: 2
+

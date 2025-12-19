@@ -1,11 +1,13 @@
 """Test CLI commands."""
 
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from click.testing import CliRunner
 
 from fuzz_generator.cli import cli
+from fuzz_generator.models import TaskResult
 
 
 class TestCLIBasic:
@@ -63,12 +65,21 @@ class TestCLIBasic:
         """Test tools subcommand help."""
         result = runner.invoke(cli, ["tools", "--help"])
         assert result.exit_code == 0
+        assert "--detailed" in result.output
 
-    def test_status(self, runner: CliRunner):
+    def test_status(self, runner: CliRunner, tmp_path: Path):
         """Test status command."""
-        result = runner.invoke(cli, ["status"])
-        assert result.exit_code == 0
-        assert "Version" in result.output
+        # Mock the MCP connection check to avoid actual connection
+        with patch("fuzz_generator.tools.mcp_client.MCPHttpClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.__aenter__.return_value = mock_instance
+            mock_instance.__aexit__.return_value = None
+            mock_instance.list_tools.side_effect = Exception("Not connected")
+            mock_client.return_value = mock_instance
+
+            result = runner.invoke(cli, ["--work-dir", str(tmp_path), "status"])
+            assert result.exit_code == 0
+            assert "Fuzz Generator Status" in result.output
 
 
 class TestAnalyzeCommand:
@@ -79,21 +90,51 @@ class TestAnalyzeCommand:
         """Create CLI test runner."""
         return CliRunner()
 
+    @pytest.fixture
+    def sample_project(self, tmp_path: Path) -> Path:
+        """Create sample project directory."""
+        project_dir = tmp_path / "sample_project"
+        project_dir.mkdir()
+        (project_dir / "main.c").write_text(
+            """
+            int process_request(char* buffer, int size) {
+                return 0;
+            }
+            """
+        )
+        return project_dir
+
+    @pytest.fixture
+    def sample_tasks(self, tmp_path: Path, sample_project: Path) -> Path:
+        """Create sample tasks file."""
+        tasks_file = tmp_path / "tasks.yaml"
+        tasks_file.write_text(
+            f"""
+project_path: "{sample_project}"
+tasks:
+  - source_file: "main.c"
+    function_name: "process_request"
+    output_name: "RequestModel"
+"""
+        )
+        return tasks_file
+
     def test_analyze_missing_required(self, runner: CliRunner):
-        """Test analyze with missing required parameters."""
+        """Test analyze without required options."""
         result = runner.invoke(cli, ["analyze"])
         assert result.exit_code != 0
+        assert "Missing option" in result.output or "required" in result.output.lower()
 
-    def test_analyze_invalid_path(self, runner: CliRunner):
+    def test_analyze_invalid_path(self, runner: CliRunner, tmp_path: Path):
         """Test analyze with invalid project path."""
         result = runner.invoke(
             cli,
             [
                 "analyze",
                 "--project-path",
-                "/nonexistent/path",
+                str(tmp_path / "nonexistent"),
                 "--source-file",
-                "main.c",
+                "test.c",
                 "--function",
                 "test",
             ],
@@ -101,55 +142,70 @@ class TestAnalyzeCommand:
         assert result.exit_code != 0
 
     def test_analyze_missing_function(self, runner: CliRunner, sample_project: Path):
-        """Test analyze with missing function option."""
+        """Test analyze with source file but no function."""
         result = runner.invoke(
             cli,
-            [
-                "analyze",
-                "--project-path",
-                str(sample_project),
-                "--source-file",
-                "main.c",
-            ],
+            ["analyze", "--project-path", str(sample_project), "--source-file", "main.c"],
         )
         assert result.exit_code != 0
-        # Should indicate mode selection error
-        assert (
-            "single function mode" in result.output.lower() or "batch mode" in result.output.lower()
-        )
+        assert "Please specify" in result.output
 
     def test_analyze_single_mode(self, runner: CliRunner, sample_project: Path):
         """Test analyze in single function mode."""
-        result = runner.invoke(
-            cli,
-            [
-                "analyze",
-                "--project-path",
-                str(sample_project),
-                "--source-file",
-                "main.c",
-                "--function",
-                "process_request",
-            ],
-        )
-        # Command should parse successfully (actual analysis not implemented yet)
-        assert result.exit_code == 0
-        assert "Analyzing" in result.output or "not yet implemented" in result.output
+        # Mock the analysis runner to avoid actual MCP connection
+        with patch("fuzz_generator.cli.runner.AnalysisRunner") as mock_runner_class:
+            mock_runner = AsyncMock()
+            mock_runner.analyze_single_function.return_value = TaskResult(
+                task_id="test",
+                success=True,
+                xml_content="<DataModel />",
+            )
+            mock_runner_class.return_value = mock_runner
 
-    def test_analyze_batch_mode(self, runner: CliRunner, sample_project: Path, sample_tasks: Path):
+            result = runner.invoke(
+                cli,
+                [
+                    "analyze",
+                    "--project-path",
+                    str(sample_project),
+                    "--source-file",
+                    "main.c",
+                    "--function",
+                    "process_request",
+                ],
+            )
+
+            # With mocking, the command should succeed
+            assert result.exit_code == 0
+
+    def test_analyze_batch_mode(
+        self, runner: CliRunner, sample_project: Path, sample_tasks: Path
+    ):
         """Test analyze in batch mode."""
-        result = runner.invoke(
-            cli,
-            [
-                "analyze",
-                "--project-path",
-                str(sample_project),
-                "--task-file",
-                str(sample_tasks),
-            ],
-        )
-        assert result.exit_code == 0
-        assert "batch" in result.output.lower() or "not yet implemented" in result.output
+        # Mock the analysis runner to avoid actual MCP connection
+        with patch("fuzz_generator.cli.runner.AnalysisRunner") as mock_runner_class:
+            mock_runner = AsyncMock()
+            mock_runner.analyze_batch.return_value = {
+                "batch_id": "test_batch",
+                "total": 1,
+                "completed": 1,
+                "failed": 0,
+            }
+            mock_runner_class.return_value = mock_runner
+
+            result = runner.invoke(
+                cli,
+                [
+                    "analyze",
+                    "--project-path",
+                    str(sample_project),
+                    "--task-file",
+                    str(sample_tasks),
+                ],
+            )
+
+            # With mocking, the command should succeed
+            assert result.exit_code == 0
 
     def test_analyze_conflicting_modes(
         self, runner: CliRunner, sample_project: Path, sample_tasks: Path
@@ -181,28 +237,48 @@ class TestParseCommand:
         """Create CLI test runner."""
         return CliRunner()
 
+    @pytest.fixture
+    def sample_project(self, tmp_path: Path) -> Path:
+        """Create sample project directory."""
+        project_dir = tmp_path / "sample_project"
+        project_dir.mkdir()
+        (project_dir / "main.c").write_text("int main() { return 0; }")
+        return project_dir
+
     def test_parse_valid_project(self, runner: CliRunner, sample_project: Path):
         """Test parse with valid project."""
-        result = runner.invoke(
-            cli,
-            ["parse", "--project-path", str(sample_project)],
-        )
-        assert result.exit_code == 0
-        assert "Parsing" in result.output or "not yet implemented" in result.output
+        # Mock the analysis runner to avoid actual MCP connection
+        with patch("fuzz_generator.cli.runner.AnalysisRunner") as mock_runner_class:
+            mock_runner = AsyncMock()
+            mock_runner.parse_project.return_value = True
+            mock_runner_class.return_value = mock_runner
+
+            result = runner.invoke(
+                cli,
+                ["parse", "--project-path", str(sample_project)],
+            )
+
+            assert result.exit_code == 0
 
     def test_parse_with_name(self, runner: CliRunner, sample_project: Path):
         """Test parse with custom project name."""
-        result = runner.invoke(
-            cli,
-            [
-                "parse",
-                "--project-path",
-                str(sample_project),
-                "--project-name",
-                "my_project",
-            ],
-        )
-        assert result.exit_code == 0
+        with patch("fuzz_generator.cli.runner.AnalysisRunner") as mock_runner_class:
+            mock_runner = AsyncMock()
+            mock_runner.parse_project.return_value = True
+            mock_runner_class.return_value = mock_runner
+
+            result = runner.invoke(
+                cli,
+                [
+                    "parse",
+                    "--project-path",
+                    str(sample_project),
+                    "--project-name",
+                    "my_project",
+                ],
+            )
+
+            assert result.exit_code == 0
 
 
 class TestCleanCommand:
@@ -217,13 +293,22 @@ class TestCleanCommand:
         """Test clean without specifying what to clean."""
         result = runner.invoke(cli, ["clean"])
         assert result.exit_code != 0
-        assert "specify what to clean" in result.output.lower() or "Missing" in result.output
+        assert "Please specify" in result.output
 
-    def test_clean_cache_only(self, runner: CliRunner):
+    def test_clean_cache_only(self, runner: CliRunner, tmp_path: Path):
         """Test clean cache only."""
-        result = runner.invoke(cli, ["clean", "--cache-only"])
-        assert result.exit_code == 0
-        assert "cache" in result.output.lower()
+        with patch("fuzz_generator.cli.runner.CacheCleaner") as mock_cleaner_class:
+            mock_cleaner = AsyncMock()
+            mock_cleaner.clear_cache_only.return_value = 5
+            mock_cleaner_class.return_value = mock_cleaner
+
+            result = runner.invoke(
+                cli,
+                ["--work-dir", str(tmp_path), "clean", "--cache-only"],
+            )
+
+            assert result.exit_code == 0
+            assert "Cleared" in result.output
 
 
 class TestToolsCommand:
@@ -238,18 +323,20 @@ class TestToolsCommand:
         """Test listing tools."""
         result = runner.invoke(cli, ["tools"])
         assert result.exit_code == 0
-        assert "parse_project" in result.output
+        assert "Available MCP Tools" in result.output
         assert "get_function_code" in result.output
+        assert "track_dataflow" in result.output
 
     def test_list_tools_detailed(self, runner: CliRunner):
         """Test listing tools with details."""
         result = runner.invoke(cli, ["tools", "--detailed"])
         assert result.exit_code == 0
-        assert "Description" in result.output
+        assert "Available MCP Tools" in result.output
+        assert "Description:" in result.output
 
 
 class TestValidators:
-    """Test input validators."""
+    """Test CLI validators."""
 
     @pytest.fixture
     def runner(self) -> CliRunner:
@@ -257,27 +344,36 @@ class TestValidators:
         return CliRunner()
 
     def test_invalid_config_file(self, runner: CliRunner, tmp_path: Path):
-        """Test with invalid config file."""
-        invalid_config = tmp_path / "invalid.txt"
-        invalid_config.write_text("not yaml")
+        """Test invalid config file."""
+        # Create an invalid config file
+        invalid_config = tmp_path / "invalid.yaml"
+        invalid_config.write_text("invalid: yaml: content:")
 
         result = runner.invoke(
             cli,
             ["--config", str(invalid_config), "status"],
         )
+        # Should fail due to invalid YAML
         assert result.exit_code != 0
 
-    def test_invalid_task_file(self, runner: CliRunner, sample_project: Path, invalid_tasks: Path):
-        """Test with invalid task file."""
+    def test_invalid_task_file(self, runner: CliRunner, tmp_path: Path):
+        """Test invalid task file in analyze command."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "main.c").write_text("int main() {}")
+
+        # Create invalid task file
+        invalid_tasks = tmp_path / "tasks.yaml"
+        invalid_tasks.write_text("tasks: not_a_list")
+
         result = runner.invoke(
             cli,
             [
                 "analyze",
                 "--project-path",
-                str(sample_project),
+                str(project_dir),
                 "--task-file",
                 str(invalid_tasks),
             ],
         )
         assert result.exit_code != 0
-        assert "function_name" in result.output.lower()

@@ -1,16 +1,11 @@
-"""XML generation module for Secray DataModel output.
+"""XML generation and validation module."""
 
-This module provides functionality for generating and validating
-Secray format XML DataModel files.
-"""
-
-from fuzz_generator.generators.validator import ValidationResult, XMLValidator
+from fuzz_generator.generators.validator import ValidationResult, XMLValidator, validate_xml
 from fuzz_generator.generators.xml_generator import XMLGenerator
 
 __all__ = [
-    # Generator
     "XMLGenerator",
-    # Validator
     "XMLValidator",
     "ValidationResult",
+    "validate_xml",
 ]

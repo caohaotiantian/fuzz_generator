@@ -1,0 +1,40 @@
+{# Jinja2 template for generating Secray XML DataModel #}
+<?xml version="1.0" encoding="utf-8"?>
+<Secray>
+{% for model in data_models %}
+    <DataModel name="{{ model.name }}"{% if model.description %} description="{{ model.description }}"{% endif %}>
+{% for element in model.elements %}
+{{ render_element(element, indent=8) }}
+{% endfor %}
+    </DataModel>
+{% endfor %}
+</Secray>
+
+{# Macro for rendering elements recursively #}
+{% macro render_element(element, indent=0) %}
+{% set spaces = ' ' * indent %}
+{% if element.element_type == 'String' %}
+{{ spaces }}<String name="{{ element.name }}"{% if element.value is not none %} value="{{ element.value }}"{% endif %}{% if element.token %} token="true"{% endif %}{% if not element.mutable %} mutable="false"{% endif %}{% if element.length is not none %} length="{{ element.length }}"{% endif %} />
+{% elif element.element_type == 'Number' %}
+{{ spaces }}<Number name="{{ element.name }}" size="{{ element.size }}"{% if element.signed %} signed="true"{% endif %}{% if element.endian != 'big' %} endian="{{ element.endian }}"{% endif %}{% if element.value is not none %} value="{{ element.value }}"{% endif %}{% if not element.mutable %} mutable="false"{% endif %} />
+{% elif element.element_type == 'Blob' %}
+{{ spaces }}<Blob name="{{ element.name }}"{% if element.length is not none %} length="{{ element.length }}"{% endif %}{% if element.min_length is not none %} minLength="{{ element.min_length }}"{% endif %}{% if element.max_length is not none %} maxLength="{{ element.max_length }}"{% endif %}{% if not element.mutable %} mutable="false"{% endif %} />
+{% elif element.element_type == 'Block' %}
+{% if element.ref %}
+{{ spaces }}<Block name="{{ element.name }}" ref="{{ element.ref }}"{% if element.min_occurs != 1 %} minOccurs="{{ element.min_occurs }}"{% endif %}{% if element.max_occurs != 1 %} maxOccurs="{{ element.max_occurs }}"{% endif %} />
+{% else %}
+{{ spaces }}<Block name="{{ element.name }}"{% if element.min_occurs != 1 %} minOccurs="{{ element.min_occurs }}"{% endif %}{% if element.max_occurs != 1 %} maxOccurs="{{ element.max_occurs }}"{% endif %}>
+{% for child in element.children %}
+{{ render_element(child, indent=indent+4) }}
+{% endfor %}
+{{ spaces }}</Block>
+{% endif %}
+{% elif element.element_type == 'Choice' %}
+{{ spaces }}<Choice name="{{ element.name }}">
+{% for option in element.options %}
+{{ render_element(option, indent=indent+4) }}
+{% endfor %}
+{{ spaces }}</Choice>
+{% endif %}
+{% endmacro %}
+

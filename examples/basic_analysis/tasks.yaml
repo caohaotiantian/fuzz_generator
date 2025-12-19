@@ -1,0 +1,24 @@
+# Basic Analysis Tasks
+# 
+# This file defines the analysis tasks for the basic example.
+# Each task specifies a function to analyze and an output name.
+
+# Project path - relative to this file's location
+project_path: "./sample_code"
+
+# Batch description (optional)
+description: "Basic analysis example - request handler"
+
+# Analysis tasks
+tasks:
+  - source_file: "handler.c"
+    function_name: "process_request"
+    output_name: "ProcessRequestModel"
+    # Priority can be used for ordering
+    priority: 10
+
+  - source_file: "handler.c"
+    function_name: "parse_header_line"
+    output_name: "ParseHeaderModel"
+    priority: 5
+

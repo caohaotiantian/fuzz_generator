@@ -1,5 +1,6 @@
 """CLI commands for fuzz_generator."""
 
+import asyncio
 from pathlib import Path
 
 import click
@@ -32,6 +33,19 @@ class AliasedGroup(click.Group):
         }
         cmd_name = aliases.get(cmd_name, cmd_name)
         return super().get_command(ctx, cmd_name)
+
+
+def _get_settings(ctx: click.Context):
+    """Get settings from context or load defaults."""
+    from fuzz_generator.config import load_config
+
+    config_path = ctx.obj.get("config_path")
+    return load_config(config_path)
+
+
+def _run_async(coro):
+    """Run an async coroutine."""
+    return asyncio.run(coro)
 
 
 @click.group(cls=AliasedGroup, context_settings=CONTEXT_SETTINGS)
@@ -190,6 +204,8 @@ def analyze(
         # Resume interrupted batch
         fuzz-generator analyze -p ./src -t tasks.yaml --resume
     """
+    from fuzz_generator.cli.runner import AnalysisRunner
+
     # Validate mode options
     single_mode = source_file is not None and function is not None
     batch_mode = task_file is not None
@@ -204,15 +220,52 @@ def analyze(
             "Cannot use both single function mode and batch mode. Please choose one."
         )
 
-    # Run analysis
-    if not ctx.obj.get("quiet"):
-        if single_mode:
-            click.echo(f"Analyzing function '{function}' in {source_file}...")
-        else:
-            click.echo(f"Running batch analysis from {task_file}...")
+    # Get settings and create runner
+    settings = _get_settings(ctx)
+    work_dir = ctx.obj.get("work_dir", Path(".fuzz_generator"))
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
 
-    # TODO: Implement actual analysis logic in Phase 3
-    click.echo(click.style("Analysis not yet implemented (Phase 3)", fg="yellow"))
+    runner = AnalysisRunner(
+        settings=settings,
+        work_dir=work_dir,
+        verbose=verbose,
+        quiet=quiet,
+    )
+
+    # Run analysis
+    if single_mode:
+        result = _run_async(
+            runner.analyze_single_function(
+                project_path=project_path,
+                source_file=source_file,
+                function_name=function,
+                output_path=output,
+                output_name=output_name,
+                knowledge_file=knowledge_file,
+            )
+        )
+
+        # Exit with error code if result is None (exception) or analysis failed
+        if result is None or not result.success:
+            ctx.exit(1)
+
+    else:  # batch_mode
+        # Determine output directory
+        output_dir = output if output else Path("output")
+
+        result = _run_async(
+            runner.analyze_batch(
+                project_path=project_path,
+                task_file=task_file,
+                output_dir=output_dir,
+                knowledge_file=knowledge_file,
+                resume=resume,
+            )
+        )
+
+        if result.get("error"):
+            ctx.exit(1)
 
 
 @cli.command()
@@ -254,11 +307,29 @@ def parse(
         fuzz-generator parse -p ./src
         fuzz-generator parse -p ./src -n my_project -l c
     """
-    if not ctx.obj.get("quiet"):
-        click.echo(f"Parsing project at {project_path}...")
+    from fuzz_generator.cli.runner import AnalysisRunner
 
-    # TODO: Implement actual parsing logic in Phase 2
-    click.echo(click.style("Parsing not yet implemented (Phase 2)", fg="yellow"))
+    settings = _get_settings(ctx)
+    work_dir = ctx.obj.get("work_dir", Path(".fuzz_generator"))
+    quiet = ctx.obj.get("quiet", False)
+
+    runner = AnalysisRunner(
+        settings=settings,
+        work_dir=work_dir,
+        verbose=ctx.obj.get("verbose", False),
+        quiet=quiet,
+    )
+
+    success = _run_async(
+        runner.parse_project(
+            project_path=project_path,
+            project_name=project_name,
+            language=language,
+        )
+    )
+
+    if not success:
+        ctx.exit(1)
 
 
 @cli.command()
@@ -305,18 +376,76 @@ def results(
         fuzz-generator results -t task_001
         fuzz-generator results -b batch_001 -f json
     """
-    ctx.obj.get("work_dir", Path(".fuzz_generator"))
+    import json as json_lib
+
+    import yaml
+
+    from fuzz_generator.cli.runner import ResultsViewer
+    from fuzz_generator.storage import JsonStorage
+
+    work_dir = ctx.obj.get("work_dir", Path(".fuzz_generator"))
+    storage = JsonStorage(base_dir=work_dir)
+    viewer = ResultsViewer(storage=storage, work_dir=work_dir)
 
     if list_all:
-        click.echo("Available results:")
-        # TODO: Implement results listing
-        click.echo(click.style("Results listing not yet implemented", fg="yellow"))
+        results_list = _run_async(viewer.list_results())
+
+        if not results_list:
+            click.echo("No results found.")
+            return
+
+        if format == "json":
+            click.echo(json_lib.dumps(results_list, indent=2))
+        elif format == "yaml":
+            click.echo(yaml.dump(results_list, default_flow_style=False))
+        else:
+            click.echo("Available results:")
+            click.echo("-" * 60)
+            for r in results_list:
+                status = (
+                    click.style("✓", fg="green") if r.get("success") else click.style("✗", fg="red")
+                )
+                click.echo(f"  {status} {r.get('task_id', 'unknown')}")
+
     elif task_id:
-        click.echo(f"Results for task: {task_id}")
-        # TODO: Implement task results display
+        result = _run_async(viewer.get_result(task_id))
+
+        if not result:
+            click.echo(f"No result found for task: {task_id}")
+            ctx.exit(1)
+
+        if format == "json":
+            click.echo(json_lib.dumps(result, indent=2))
+        elif format == "yaml":
+            click.echo(yaml.dump(result, default_flow_style=False))
+        else:
+            click.echo(f"Result for task: {task_id}")
+            click.echo("-" * 40)
+            click.echo(f"  Success: {result.get('success', False)}")
+            if result.get("xml_content"):
+                click.echo("  XML Content:")
+                click.echo(result.get("xml_content"))
+
     elif batch_id:
-        click.echo(f"Results for batch: {batch_id}")
-        # TODO: Implement batch results display
+        results_list = _run_async(viewer.get_batch_results(batch_id))
+
+        if not results_list:
+            click.echo(f"No results found for batch: {batch_id}")
+            return
+
+        if format == "json":
+            click.echo(json_lib.dumps(results_list, indent=2))
+        elif format == "yaml":
+            click.echo(yaml.dump(results_list, default_flow_style=False))
+        else:
+            click.echo(f"Results for batch: {batch_id}")
+            click.echo("-" * 40)
+            for r in results_list:
+                status = (
+                    click.style("✓", fg="green") if r.get("success") else click.style("✗", fg="red")
+                )
+                click.echo(f"  {status} {r.get('task_id', 'unknown')}")
+
     else:
         click.echo("Use --list to view all results or specify --task-id or --batch-id")
 
@@ -359,13 +488,18 @@ def clean(
 ) -> None:
     """Clean cache and intermediate results.
 
-
+    \b
     Examples:
         fuzz-generator clean --all
         fuzz-generator clean -t task_001
         fuzz-generator clean --cache-only
     """
-    ctx.obj.get("work_dir", Path(".fuzz_generator"))
+    from fuzz_generator.cli.runner import CacheCleaner
+    from fuzz_generator.storage import JsonStorage
+
+    work_dir = ctx.obj.get("work_dir", Path(".fuzz_generator"))
+    storage = JsonStorage(base_dir=work_dir)
+    cleaner = CacheCleaner(storage=storage, work_dir=work_dir)
 
     if not clear_all and not task_id and not cache_only:
         raise click.UsageError("Please specify what to clean: --all, --task-id, or --cache-only")
@@ -376,18 +510,19 @@ def clean(
                 click.echo("Aborted.")
                 return
 
-        click.echo("Clearing all data...")
-        # TODO: Implement actual cleanup
+        count = _run_async(cleaner.clear_all())
+        click.echo(click.style(f"Cleared {count} items", fg="green"))
 
     elif task_id:
-        click.echo(f"Clearing data for task: {task_id}")
-        # TODO: Implement task-specific cleanup
+        success = _run_async(cleaner.clear_task(task_id))
+        if success:
+            click.echo(click.style(f"Cleared data for task: {task_id}", fg="green"))
+        else:
+            click.echo(f"No data found for task: {task_id}")
 
     elif cache_only:
-        click.echo("Clearing cache...")
-        # TODO: Implement cache cleanup
-
-    click.echo(click.style("Cleanup completed", fg="green"))
+        count = _run_async(cleaner.clear_cache_only())
+        click.echo(click.style(f"Cleared {count} cache items", fg="green"))
 
 
 @cli.command(name="tools")
@@ -398,19 +533,56 @@ def clean(
     default=False,
     help="Show detailed tool information",
 )
+@click.option(
+    "--test",
+    is_flag=True,
+    default=False,
+    help="Test MCP server connection",
+)
 @click.pass_context
-def list_tools(ctx: click.Context, detailed: bool) -> None:
+def list_tools(ctx: click.Context, detailed: bool, test: bool) -> None:
     """List available MCP tools from Joern server.
 
     \b
     Examples:
         fuzz-generator tools
         fuzz-generator tools --detailed
+        fuzz-generator tools --test
     """
+    if test:
+        # Test MCP connection
+        from fuzz_generator.tools.mcp_client import MCPClientConfig, MCPHttpClient
+
+        settings = _get_settings(ctx)
+        config = MCPClientConfig(
+            url=settings.mcp_server.url,
+            timeout=settings.mcp_server.timeout,
+        )
+
+        click.echo(f"Testing connection to: {config.url}")
+
+        async def test_connection():
+            try:
+                async with MCPHttpClient(config) as client:
+                    tools = await client.list_tools()
+                    return tools
+            except Exception as e:
+                return str(e)
+
+        result = _run_async(test_connection())
+
+        if isinstance(result, str):
+            click.echo(click.style(f"✗ Connection failed: {result}", fg="red"))
+            ctx.exit(1)
+        else:
+            click.echo(click.style("✓ Connection successful", fg="green"))
+            click.echo(f"  Available tools: {len(result)}")
+            return
+
     click.echo("Available MCP Tools:")
     click.echo("-" * 40)
 
-    # Static list for now, will be dynamic in Phase 2
+    # Tool list with descriptions
     tools = [
         ("parse_project", "Parse project and generate CPG"),
         ("list_projects", "List parsed projects"),
@@ -430,7 +602,6 @@ def list_tools(ctx: click.Context, detailed: bool) -> None:
         if detailed:
             click.echo(f"\n{click.style(name, fg='cyan', bold=True)}")
             click.echo(f"  Description: {desc}")
-            click.echo("  Parameters: (not yet available)")
         else:
             click.echo(f"  {click.style(name, fg='cyan'):30} {desc}")
 
@@ -446,9 +617,10 @@ def status(ctx: click.Context) -> None:
     - Running tasks
     - Cache statistics
     """
+    from fuzz_generator.storage import JsonStorage
+    from fuzz_generator.tools.mcp_client import MCPClientConfig, MCPHttpClient
+
     work_dir = ctx.obj.get("work_dir", Path(".fuzz_generator"))
-    # work_dir will be used when implementing results display
-    # work_dir = ctx.obj.get("work_dir", Path(".fuzz_generator"))
     config_path = ctx.obj.get("config_path")
 
     click.echo(click.style("Fuzz Generator Status", fg="cyan", bold=True))
@@ -458,13 +630,54 @@ def status(ctx: click.Context) -> None:
     click.echo(f"Work Directory: {work_dir}")
     click.echo(f"Config File: {config_path or 'Using defaults'}")
 
-    # TODO: Add actual status checks
-    click.echo("\nMCP Server: " + click.style("Not connected", fg="yellow"))
-    click.echo("Running Tasks: 0")
-    click.echo("Cached Results: N/A")
+    # Load settings
+    settings = _get_settings(ctx)
+    click.echo(f"\nLLM Model: {settings.llm.model}")
+    click.echo(f"LLM URL: {settings.llm.base_url}")
+    click.echo(f"MCP Server: {settings.mcp_server.url}")
+
+    # Test MCP connection
+    click.echo("\nMCP Server Status:")
+    config = MCPClientConfig(
+        url=settings.mcp_server.url,
+        timeout=5,  # Short timeout for status check
+    )
+
+    async def check_mcp():
+        try:
+            async with MCPHttpClient(config) as client:
+                await client.list_tools()
+                return True
+        except Exception:
+            return False
+
+    mcp_ok = _run_async(check_mcp())
+    if mcp_ok:
+        click.echo(click.style("  ✓ Connected", fg="green"))
+    else:
+        click.echo(click.style("  ✗ Not available", fg="red"))
+
+    # Storage stats
+    click.echo("\nStorage:")
+    storage = JsonStorage(base_dir=work_dir)
+
+    async def get_storage_stats():
+        categories = await storage.list_categories()
+        stats = {}
+        for cat in categories:
+            keys = await storage.list_keys(cat)
+            stats[cat] = len(keys)
+        return stats
+
+    stats = _run_async(get_storage_stats())
+    if stats:
+        for cat, count in stats.items():
+            click.echo(f"  {cat}: {count} items")
+    else:
+        click.echo("  No cached data")
 
 
-def main() -> None:
+def main():
     """Main entry point."""
     cli()
 
