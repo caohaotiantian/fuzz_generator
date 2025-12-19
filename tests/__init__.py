@@ -1,2 +1,1 @@
 """Fuzz Generator Test Suite."""
-

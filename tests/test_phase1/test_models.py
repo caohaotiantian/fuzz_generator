@@ -1,7 +1,5 @@
 """Test data models."""
 
-
-
 from fuzz_generator.models import (
     AnalysisContext,
     AnalysisTask,
@@ -249,9 +247,7 @@ class TestFunctionModels:
             parameters=[
                 ParameterInfo(name="in_param", type="int", direction=ParameterDirection.IN),
                 ParameterInfo(name="out_param", type="int*", direction=ParameterDirection.OUT),
-                ParameterInfo(
-                    name="inout_param", type="int*", direction=ParameterDirection.INOUT
-                ),
+                ParameterInfo(name="inout_param", type="int*", direction=ParameterDirection.INOUT),
             ],
         )
 
@@ -424,4 +420,3 @@ class TestXMLModels:
         # Test round-trip
         loaded = DataModel.from_dict(dict_repr)
         assert loaded.name == model.name
-
