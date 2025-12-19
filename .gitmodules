@@ -1,0 +1,3 @@
+[submodule "joern_mcp"]
+	path = joern_mcp
+	url = https://github.com/caohaotiantian/joern_mcp.git

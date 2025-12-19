@@ -1,0 +1,206 @@
+# Fuzz Generator 配置示例
+# 复制此文件为 config.yaml 并根据实际情况修改
+
+version: "1.0"
+
+# =============================================================================
+# LLM 配置
+# =============================================================================
+llm:
+  # API基础地址 (本地部署模型示例)
+  base_url: "http://localhost:11434/v1"
+
+  # API密钥 (本地模型可设置为任意值)
+  api_key: "ollama"
+
+  # 模型名称
+  model: "qwen2.5:32b"
+
+  # 生成参数
+  temperature: 0.7 # 生成多样性 (0.0-1.0)
+  max_tokens: 4096 # 最大输出token数
+  top_p: 0.9 # 核采样参数
+
+  # 超时设置 (秒)
+  timeout: 120
+
+  # 重试配置
+  retry_count: 3
+  retry_delay: 2.0
+
+# =============================================================================
+# MCP 服务器配置
+# =============================================================================
+mcp_server:
+  # Joern MCP Server 地址
+  url: "http://localhost:8000/mcp"
+
+  # 请求超时 (秒)
+  timeout: 60
+
+  # 重试配置
+  retry_count: 3
+  retry_delay: 2.0
+
+  # 连接池配置
+  max_connections: 10
+  keepalive_expiry: 30
+
+# =============================================================================
+# Agent 配置
+# =============================================================================
+agents:
+  # 通用配置
+  common:
+    # 是否显示思考过程
+    verbose: true
+    # 人工干预模式 (NEVER, ALWAYS, TERMINATE)
+    human_input_mode: "NEVER"
+
+  # 编排Agent
+  orchestrator:
+    # 系统提示词文件 (相对于prompts目录)
+    system_prompt_file: "orchestrator.yaml"
+    # 最大对话轮数
+    max_rounds: 50
+
+  # 代码分析Agent
+  code_analyzer:
+    system_prompt_file: "code_analyzer.yaml"
+    # 单次分析最大迭代次数
+    max_iterations: 10
+    # 可用工具列表
+    tools:
+      - "get_function_code"
+      - "list_functions"
+      - "search_code"
+
+  # 上下文构建Agent
+  context_builder:
+    system_prompt_file: "context_builder.yaml"
+    max_iterations: 15
+    tools:
+      - "track_dataflow"
+      - "analyze_variable_flow"
+      - "find_data_dependencies"
+      - "get_callers"
+      - "get_callees"
+      - "get_call_chain"
+      - "get_control_flow_graph"
+
+  # 模型生成Agent
+  model_generator:
+    system_prompt_file: "model_generator.yaml"
+    max_iterations: 5
+    # 无直接工具调用，基于上下文生成
+
+# =============================================================================
+# 输出配置
+# =============================================================================
+output:
+  # 输出格式
+  format: "xml"
+
+  # XML编码
+  encoding: "utf-8"
+
+  # 缩进空格数
+  indent: 4
+
+  # 是否包含注释
+  include_comments: true
+
+  # 仅生成DataModel部分（不包含StateModel和Test）
+  datamodel_only: true
+
+  # 默认输出目录
+  default_output_dir: "./output"
+
+# =============================================================================
+# 批量任务配置
+# =============================================================================
+batch:
+  # 并发执行的最大任务数（0表示顺序执行，1表示串行）
+  max_concurrent: 1
+
+  # 任务失败后是否继续执行其他任务
+  fail_fast: false
+
+  # 单个任务超时时间（秒）
+  task_timeout: 600
+
+  # 进度报告间隔（秒）
+  progress_interval: 10
+
+# =============================================================================
+# 存储配置
+# =============================================================================
+storage:
+  # 工作目录
+  work_dir: ".fuzz_generator"
+
+  # 是否启用缓存
+  enable_cache: true
+
+  # 缓存过期时间（小时），0表示永不过期
+  cache_expiry_hours: 0
+
+  # 是否保存Agent对话记录
+  save_conversations: true
+
+  # 是否启用断点续传
+  enable_resume: true
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  # 日志级别 (DEBUG, INFO, WARNING, ERROR)
+  level: "INFO"
+
+  # 日志文件路径
+  file: "logs/fuzz_generator.log"
+
+  # 日志轮转大小
+  rotation: "10 MB"
+
+  # 日志保留时间
+  retention: "7 days"
+
+  # 是否压缩旧日志
+  compression: true
+
+  # 控制台输出格式
+  console_format: "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+
+# =============================================================================
+# 分析配置
+# =============================================================================
+analysis:
+  # 数据流分析最大深度
+  max_dataflow_depth: 10
+
+  # 调用链最大深度
+  max_call_chain_depth: 5
+
+  # 单次分析最大流数量
+  max_flows: 20
+
+  # 是否分析间接调用
+  include_indirect_calls: true
+
+  # 超时设置 (秒)
+  timeout: 300
+
+# =============================================================================
+# 自定义背景知识配置
+# =============================================================================
+knowledge:
+  # 是否启用自定义背景知识
+  enabled: true
+
+  # 背景知识文件目录
+  knowledge_dir: "./knowledge"
+
+  # 默认背景知识文件
+  default_file: null
