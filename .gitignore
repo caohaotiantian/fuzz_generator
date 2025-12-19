@@ -1,0 +1,6 @@
+.fuzz_generator/
+*.egg-info/
+.coverage
+uv.lock
+**/__pycache__/
+venv/
