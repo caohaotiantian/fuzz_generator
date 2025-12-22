@@ -364,9 +364,7 @@ class ConversationRecorder:
                 "timestamp": datetime.now().isoformat(),
                 "agent": agent_name,
                 "role": role,
-                "content": content[:2000]
-                if len(content) > 2000
-                else content,  # Truncate long content
+                "content": content,  # No truncation - full content needed for debugging
             }
         )
 
@@ -400,7 +398,7 @@ class ConversationRecorder:
         # Find matching tool call and update result
         for tc in reversed(self.tool_calls):
             if tc.get("call_id") == call_id:
-                tc["result"] = result[:2000] if len(result) > 2000 else result
+                tc["result"] = result  # No truncation - full result needed for LLM analysis
                 tc["is_error"] = is_error
                 tc["completed_at"] = datetime.now().isoformat()
                 break
@@ -671,7 +669,7 @@ class TwoPhaseWorkflow:
                     source = getattr(msg, "source", "unknown")
                     content = self._extract_content(msg)
                     msg_type = type(msg).__name__
-                    logger.info(f"[{msg_type}] {source}: {content[:200]}...")
+                    logger.info(f"[{msg_type}] {source}: {content}...")
 
             # Record conversation and tool calls
             if hasattr(result, "messages"):
@@ -722,7 +720,7 @@ class TwoPhaseWorkflow:
                     source = getattr(msg, "source", "unknown")
                     content = self._extract_content(msg)
                     msg_type = type(msg).__name__
-                    logger.info(f"[Gen] [{msg_type}] {source}: {content[:200]}...")
+                    logger.info(f"[Gen] [{msg_type}] {source}: {content}...")
 
             # Record conversation (no tool calls in generation phase)
             if hasattr(result, "messages"):
@@ -749,10 +747,11 @@ class TwoPhaseWorkflow:
             # Get content for all message types
             content = getattr(msg, "content", None)
 
-            # Debug: log message type and content sample
+            # Debug: log message type and full content (no truncation)
             if content:
-                content_preview = str(content)[:100] if content else "None"
-                logger.debug(f"Message type: {msg_type}, content preview: {content_preview}")
+                content_str = str(content)
+                logger.debug(f"Message type: {msg_type}, content length: {len(content_str)}")
+                logger.debug(f"Message content: {content_str}")
 
             # Handle ToolCallRequestEvent - tool calls made by agent
             if msg_type == "ToolCallRequestEvent":
@@ -812,7 +811,7 @@ class TwoPhaseWorkflow:
                 # Check for tool result pattern in string format (legacy format)
                 # Format: content='...' name='tool_name' call_id='xxx' is_error=False
                 if "call_id=" in content and "is_error=" in content:
-                    logger.debug(f"Detected legacy tool result pattern: {content[:100]}...")
+                    logger.debug(f"Detected legacy tool result pattern in content (length={len(content)})")
                     self._parse_tool_result_string(agent_name, content)
                     # Extract and record only the actual content
                     content_match = re.search(r"content=['\"](.+?)['\"] name=", content, re.DOTALL)
@@ -870,7 +869,8 @@ class TwoPhaseWorkflow:
         """
         call_id_match = re.search(r"call_id=['\"]([^'\"]+)['\"]", content)
         if not call_id_match:
-            logger.debug(f"No call_id found in tool result string: {content[:100]}...")
+            logger.debug(f"No call_id found in tool result string (length={len(content)})")
+            logger.debug(f"Full content: {content}")
             return
 
         call_id = call_id_match.group(1)
