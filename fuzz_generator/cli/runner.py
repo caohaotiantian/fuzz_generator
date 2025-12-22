@@ -64,6 +64,97 @@ class AnalysisRunner:
             retry_delay=settings.mcp_server.retry_delay,
         )
 
+    async def _ensure_project_parsed(
+        self,
+        mcp_client: MCPHttpClient,
+        project_path: Path,
+        project_name: str,
+        language: str = "auto",
+        auto_parse: bool = True,
+    ) -> tuple[bool, str]:
+        """Ensure project is parsed, auto-parse if needed.
+
+        Args:
+            mcp_client: MCP client instance
+            project_path: Path to source code project
+            project_name: Project name
+            language: Source language
+            auto_parse: Whether to auto-parse if project not found
+
+        Returns:
+            (success, effective_project_name) tuple
+        """
+        # First, check available projects to verify if project actually exists
+        from fuzz_generator.tools.project_tools import list_projects
+
+        projects_result = await list_projects(mcp_client)
+        project_exists = False
+        available = []
+
+        if projects_result.success and projects_result.projects:
+            available = [p.name for p in projects_result.projects]
+            project_exists = project_name in available
+
+        # If project exists, switch to it and return
+        if project_exists:
+            switch_result = await switch_project(mcp_client, project_name)
+            if switch_result.success:
+                return (True, project_name)
+            else:
+                logger.warning(
+                    f"Project {project_name} exists but failed to switch: {switch_result.error}"
+                )
+
+        # Project doesn't exist - decide whether to auto-parse
+        if not auto_parse:
+            if available:
+                click.echo(
+                    click.style(
+                        f"Project '{project_name}' not found. Available: {available}",
+                        fg="yellow",
+                    )
+                )
+                click.echo("  Please specify correct project name with --project-name")
+            else:
+                click.echo(
+                    click.style("No projects found. Please run 'parse' command first.", fg="red")
+                )
+            return (False, project_name)
+
+        # Auto-parse the project
+        if not self.quiet:
+            if available:
+                click.echo(
+                    click.style(
+                        f"Project '{project_name}' not found in {available}, auto-parsing...",
+                        fg="yellow",
+                    )
+                )
+            else:
+                click.echo(
+                    click.style(f"No projects found, auto-parsing '{project_name}'...", fg="yellow")
+                )
+
+        # Parse project (using the same client, ensure absolute path)
+        absolute_path = project_path.resolve()
+        lang_param = None if language == "auto" else language
+        result = await parse_project(
+            mcp_client,
+            source_path=str(absolute_path),
+            project_name=project_name,
+            language=lang_param,
+        )
+
+        if result.success:
+            if not self.quiet:
+                click.echo(click.style("✓ Project parsed successfully", fg="green"))
+            # Switch to newly parsed project
+            await switch_project(mcp_client, project_name)
+            return (True, project_name)
+        else:
+            click.echo(click.style(f"✗ Failed to parse project: {result.error}", fg="red"))
+            return (False, project_name)
+
     async def parse_project(
         self,
         project_path: Path,
@@ -73,6 +164,9 @@ class AnalysisRunner:
         """Parse a project to generate CPG.
 
         Implements: fuzz-generator parse -p ./src
+
+        Note: This is an optional pre-processing step. The analyze command
+        will automatically parse projects if needed.
 
         Args:
             project_path: Path to source code project
@@ -167,35 +261,17 @@ class AnalysisRunner:
 
         try:
             async with MCPHttpClient(self.mcp_config) as mcp_client:
-                # Try to switch to project, or list available projects on failure
-                switch_result = await switch_project(mcp_client, effective_project_name)
-                if not switch_result.success:
-                    # Try to find the project
-                    from fuzz_generator.tools.project_tools import list_projects
+                # Ensure project is parsed (auto-parse if needed)
+                success, effective_project_name = await self._ensure_project_parsed(
+                    mcp_client=mcp_client,
+                    project_path=project_path,
+                    project_name=effective_project_name,
+                    language="auto",
+                    auto_parse=True,
+                )
 
-                    projects_result = await list_projects(mcp_client)
-                    if projects_result.success and projects_result.projects:
-                        available = [p.name for p in projects_result.projects]
-                        click.echo(
-                            click.style(
-                                f"Project '{effective_project_name}' not found. "
-                                f"Available: {available}",
-                                fg="yellow",
-                            )
-                        )
-                        # Try first available project as fallback
-                        if len(available) == 1:
-                            effective_project_name = available[0]
-                            click.echo(f"  Using project: {effective_project_name}")
-                            await switch_project(mcp_client, effective_project_name)
-                        else:
-                            click.echo("  Please specify project name with --project-name")
-                            return None
-                    else:
-                        click.echo(
-                            click.style("No projects found. Run 'parse' command first.", fg="red")
-                        )
-                        return None
+                if not success:
+                    return None
 
                 # Run analysis with AutoGen agents (uses custom model client)
                 from fuzz_generator.agents.autogen_agents import AnalysisWorkflowRunner
@@ -293,8 +369,17 @@ class AnalysisRunner:
 
         try:
             async with MCPHttpClient(self.mcp_config) as mcp_client:
-                # Ensure project is parsed
-                await switch_project(mcp_client, project_name)
+                # Ensure project is parsed (auto-parse if needed)
+                success, project_name = await self._ensure_project_parsed(
+                    mcp_client=mcp_client,
+                    project_path=project_path,
+                    project_name=project_name,
+                    language="auto",
+                    auto_parse=True,
+                )
+
+                if not success:
+                    return {"error": "Failed to initialize project", "completed": 0, "failed": 0}
 
                 # Create workflow runner
                 from fuzz_generator.agents.autogen_agents import AnalysisWorkflowRunner

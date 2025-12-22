@@ -99,15 +99,18 @@ def cli(
     Generate fuzz test data models from source code functions using
     LLM-powered analysis and Joern static analysis.
 
+    The analyze command automatically parses projects if needed, so you can
+    start analyzing right away without running 'parse' first.
+
     \b
-    Examples:
-        # Analyze a single function
+    Quick Start:
+        # Analyze a single function (auto-parses if needed)
         fuzz-generator analyze -p ./src -f handler.c -fn process_request
 
         # Batch analyze from task file
         fuzz-generator analyze -p ./src -t tasks.yaml
 
-        # Parse project first
+        # Optional: Pre-parse a large project
         fuzz-generator parse -p ./src
     """
     # Ensure context object exists
@@ -201,6 +204,10 @@ def analyze(
 ) -> None:
     """Analyze functions and generate DataModel definitions.
 
+    This command automatically parses the project if it hasn't been parsed yet.
+    You don't need to run 'parse' command separately unless you want to
+    pre-process the project with specific options.
+
     \b
     Supports two modes:
     1. Single function mode: use -f and -fn options
@@ -208,13 +215,13 @@ def analyze(
 
     \b
     Examples:
-        # Single function analysis
+        # Single function analysis (auto-parses if needed)
         fuzz-generator analyze -p ./src -f handler.c -fn process_request -o output.xml
 
-        # With explicit project name (from parse command)
+        # With explicit project name
         fuzz-generator analyze -p ./src -f handler.c -fn process_request -pn my_project
 
-        # Batch analysis
+        # Batch analysis (auto-parses if needed)
         fuzz-generator analyze -p ./src -t tasks.yaml -o ./output/
 
         # Resume interrupted batch
@@ -316,13 +323,20 @@ def parse(
 ) -> None:
     """Parse project and generate Code Property Graph (CPG).
 
-    This is a pre-processing step that prepares the project for analysis.
-    The CPG is cached for subsequent analysis operations.
+    This is an OPTIONAL pre-processing step. The 'analyze' command will
+    automatically parse projects if needed, so you don't need to run this
+    separately in most cases.
+
+    Use this command when you want to:
+    - Pre-process a large project to save time later
+    - Specify a custom project name or language
+    - Verify the project can be parsed before analysis
 
     \b
     Examples:
         fuzz-generator parse -p ./src
         fuzz-generator parse -p ./src -pn my_project -l c
+        fuzz-generator parse -p ./src -l cpp
     """
     from fuzz_generator.cli.runner import AnalysisRunner
 
