@@ -88,7 +88,7 @@ async def parse_project(
     client: "MCPHttpClient",
     source_path: str,
     project_name: str | None = None,
-    language: str = "auto",
+    language: str | None = None,
 ) -> ParseProjectResult:
     """Parse source code project and create Code Property Graph.
 
@@ -96,7 +96,7 @@ async def parse_project(
         client: MCP HTTP client instance
         source_path: Path to source code directory
         project_name: Optional project name (defaults to directory name)
-        language: Programming language (default: "auto" for auto-detection)
+        language: Programming language (None or "auto" for auto-detection)
 
     Returns:
         ParseProjectResult with operation status
@@ -106,12 +106,17 @@ async def parse_project(
     """
     logger.info(f"Parsing project: {source_path}")
 
-    arguments = {
+    # Build arguments dict, only include non-None values
+    arguments: dict[str, str] = {
         "source_path": source_path,
-        "language": language,
     }
+
+    # Add optional parameters only if provided
     if project_name:
         arguments["project_name"] = project_name
+
+    if language:
+        arguments["language"] = language
 
     try:
         result = await client.call_tool("parse_project", arguments)

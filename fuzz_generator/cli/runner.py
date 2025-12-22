@@ -90,11 +90,13 @@ class AnalysisRunner:
 
         try:
             async with MCPHttpClient(self.mcp_config) as client:
+                # Only pass language if not "auto" (let MCP server auto-detect)
+                lang_param = None if language == "auto" else language
                 result = await parse_project(
                     client,
                     source_path=str(project_path),
                     project_name=name,
-                    language=language if language != "auto" else None,
+                    language=lang_param,
                 )
 
                 if result.success:
