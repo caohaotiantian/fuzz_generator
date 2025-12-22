@@ -84,12 +84,14 @@ class TestBatchExecutor:
     @pytest.fixture
     def mock_task_executor(self):
         """Create mock task executor."""
+
         async def executor(task: AnalysisTask) -> TaskResult:
             return TaskResult(
                 task_id=task.task_id,
                 success=True,
                 xml_content="<DataModel>...</DataModel>",
             )
+
         return AsyncMock(side_effect=executor)
 
     @pytest.fixture
@@ -178,6 +180,7 @@ class TestBatchExecutor:
     @pytest.mark.asyncio
     async def test_fail_fast(self, sample_batch):
         """Test fail-fast behavior."""
+
         async def failing_executor(task: AnalysisTask) -> TaskResult:
             return TaskResult(task_id=task.task_id, success=False, errors=["Task failed"])
 
@@ -349,6 +352,7 @@ class TestBatchExecutorEdgeCases:
     @pytest.mark.asyncio
     async def test_exception_in_executor(self, sample_batch):
         """Test exception handling in task executor."""
+
         async def failing_executor(task: AnalysisTask) -> TaskResult:
             raise RuntimeError("Unexpected error")
 

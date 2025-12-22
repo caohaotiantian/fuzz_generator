@@ -225,4 +225,3 @@ class TestCustomModelClientEdgeCases:
             model="custom-model-name",
         )
         assert client._model == "custom-model-name"
-

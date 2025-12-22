@@ -178,9 +178,7 @@ tasks:
             # With mocking, the command should succeed
             assert result.exit_code == 0
 
-    def test_analyze_batch_mode(
-        self, runner: CliRunner, sample_project: Path, sample_tasks: Path
-    ):
+    def test_analyze_batch_mode(self, runner: CliRunner, sample_project: Path, sample_tasks: Path):
         """Test analyze in batch mode."""
         # Mock the analysis runner to avoid actual MCP connection
         with patch("fuzz_generator.cli.runner.AnalysisRunner") as mock_runner_class:

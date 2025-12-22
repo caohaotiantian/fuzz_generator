@@ -59,6 +59,7 @@ class TestProjectTools:
             mock_client,
             source_path="/path/to/source",
             project_name="test_project",
+            language="auto",
         )
 
         assert isinstance(result, ParseProjectResult)
@@ -371,7 +372,7 @@ class TestQueryTools:
 
     @pytest.mark.asyncio
     async def test_get_function_code_with_file(self, mock_client):
-        """Test getting function code with file name filter."""
+        """Test getting function code with file filter."""
         mock_client.call_tool.return_value = MCPToolResult(
             success=True,
             data={
@@ -392,9 +393,9 @@ class TestQueryTools:
 
         assert result.success is True
 
-        # Verify file_name was passed
+        # Verify file_filter was passed to MCP (internal parameter name)
         call_args = mock_client.call_tool.call_args
-        assert call_args[0][1]["file_name"] == "handler.c"
+        assert call_args[0][1]["file_filter"] == "handler.c"
 
     @pytest.mark.asyncio
     async def test_get_function_code_not_found(self, mock_client):

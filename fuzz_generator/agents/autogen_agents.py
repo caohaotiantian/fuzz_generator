@@ -746,15 +746,20 @@ class TwoPhaseWorkflow:
             agent_name = getattr(msg, "source", default_agent)
             msg_type = type(msg).__name__
 
-            # Handle different message types
-            if msg_type == "ToolCallRequestEvent" or hasattr(msg, "content"):
-                content = getattr(msg, "content", None)
+            # Get content for all message types
+            content = getattr(msg, "content", None)
 
-                # Check if content contains FunctionCall objects
+            # Debug: log message type and content sample
+            if content:
+                content_preview = str(content)[:100] if content else "None"
+                logger.debug(f"Message type: {msg_type}, content preview: {content_preview}")
+
+            # Handle ToolCallRequestEvent - tool calls made by agent
+            if msg_type == "ToolCallRequestEvent":
                 if isinstance(content, list):
                     for item in content:
                         if hasattr(item, "name") and hasattr(item, "arguments"):
-                            # This is a FunctionCall
+                            # This is a FunctionCall object
                             try:
                                 args = (
                                     json.loads(item.arguments)
@@ -765,39 +770,71 @@ class TwoPhaseWorkflow:
                                 args = {"raw": item.arguments}
 
                             call_id = getattr(item, "id", None)
+                            logger.debug(f"Recording tool call: {item.name} with call_id={call_id}")
                             self.recorder.record_tool_call(
                                 agent_name=agent_name,
                                 tool_name=item.name,
                                 arguments=args,
                                 call_id=call_id,
                             )
-                        else:
-                            # Regular content item
-                            self.recorder.record(agent_name, str(item))
-                elif isinstance(content, str):
-                    # Check for FunctionCall string pattern
-                    if content.startswith("FunctionCall("):
-                        self._parse_function_call_string(agent_name, content)
-                    else:
-                        self.recorder.record(agent_name, content)
-                elif content is not None:
-                    self.recorder.record(agent_name, str(content))
+                continue  # Don't record raw ToolCallRequestEvent to conversation
 
-            # Handle ToolCallResultEvent (tool results)
-            if msg_type == "ToolCallResultEvent" or (
-                hasattr(msg, "content") and hasattr(msg, "call_id")
-            ):
-                call_id = getattr(msg, "call_id", None)
-                content = getattr(msg, "content", "")
-                is_error = getattr(msg, "is_error", False)
+            # Handle ToolCallExecutionEvent - tool execution results
+            if msg_type == "ToolCallExecutionEvent":
+                if isinstance(content, list):
+                    for item in content:
+                        if hasattr(item, "call_id") and hasattr(item, "content"):
+                            # This is a FunctionExecutionResult object
+                            call_id = getattr(item, "call_id", None)
+                            result_content = getattr(item, "content", "")
+                            is_error = getattr(item, "is_error", False)
 
-                if call_id:
-                    self.recorder.record_tool_result(call_id, str(content), is_error)
+                            logger.debug(
+                                f"Recording tool result: call_id={call_id}, content_len={len(str(result_content))}"
+                            )
+                            if call_id:
+                                self.recorder.record_tool_result(
+                                    call_id, str(result_content), is_error
+                                )
+                continue  # Don't record raw ToolCallExecutionEvent to conversation
 
-            # Also check for result patterns in content string
-            content = getattr(msg, "content", "")
-            if isinstance(content, str) and "call_id=" in content:
-                self._parse_tool_result_string(agent_name, content)
+            # Handle ToolCallSummaryMessage - clean summary of tool results for conversation
+            if msg_type == "ToolCallSummaryMessage":
+                if isinstance(content, str):
+                    self.recorder.record(agent_name, content)
+                continue
+
+            # Handle other message types (TextMessage, ThoughtEvent, etc.)
+            if content is None:
+                continue
+
+            if isinstance(content, str):
+                # Check for tool result pattern in string format (legacy format)
+                # Format: content='...' name='tool_name' call_id='xxx' is_error=False
+                if "call_id=" in content and "is_error=" in content:
+                    logger.debug(f"Detected legacy tool result pattern: {content[:100]}...")
+                    self._parse_tool_result_string(agent_name, content)
+                    # Extract and record only the actual content
+                    content_match = re.search(r"content=['\"](.+?)['\"] name=", content, re.DOTALL)
+                    if content_match:
+                        actual_content = (
+                            content_match.group(1).replace("\\n", "\n").replace("\\\\", "\\")
+                        )
+                        self.recorder.record(agent_name, actual_content)
+                # Check for FunctionCall string pattern (legacy format)
+                elif content.startswith("FunctionCall("):
+                    self._parse_function_call_string(agent_name, content)
+                    # Don't record the raw FunctionCall string to conversation
+                else:
+                    # Normal text message
+                    self.recorder.record(agent_name, content)
+            elif isinstance(content, list):
+                # Some messages have list content that's not tool-related
+                for item in content:
+                    self.recorder.record(agent_name, str(item))
+            else:
+                # Fallback for other content types
+                self.recorder.record(agent_name, str(content))
 
     def _parse_function_call_string(self, agent_name: str, content: str) -> None:
         """Parse FunctionCall string representation and record it."""
@@ -827,18 +864,36 @@ class TwoPhaseWorkflow:
             )
 
     def _parse_tool_result_string(self, agent_name: str, content: str) -> None:
-        """Parse tool result string and record it."""
-        # Pattern: content='...' name='tool_name' call_id='xxx' is_error=False
+        """Parse tool result string and record it.
+
+        Format: content='...' name='tool_name' call_id='xxx' is_error=False
+        """
         call_id_match = re.search(r"call_id=['\"]([^'\"]+)['\"]", content)
+        if not call_id_match:
+            logger.debug(f"No call_id found in tool result string: {content[:100]}...")
+            return
+
+        call_id = call_id_match.group(1)
         is_error_match = re.search(r"is_error=(True|False)", content)
+        is_error = is_error_match.group(1) == "True" if is_error_match else False
+
+        # Try to extract content between content='...' and name=
+        # Use DOTALL flag to match across newlines
         content_match = re.search(r"content=['\"](.+?)['\"] name=", content, re.DOTALL)
 
-        if call_id_match:
-            call_id = call_id_match.group(1)
-            is_error = is_error_match.group(1) == "True" if is_error_match else False
-            result_content = content_match.group(1) if content_match else content
+        if content_match:
+            result_content = content_match.group(1)
+            # Unescape common escape sequences
+            result_content = result_content.replace("\\n", "\n").replace("\\\\", "\\")
+        else:
+            # Fallback: use the whole content string
+            result_content = content
+            logger.debug("Could not extract result content from string, using full content")
 
-            self.recorder.record_tool_result(call_id, result_content, is_error)
+        logger.debug(
+            f"Parsed tool result: call_id={call_id}, is_error={is_error}, content_len={len(result_content)}"
+        )
+        self.recorder.record_tool_result(call_id, result_content, is_error)
 
     def _extract_content(self, msg: Any) -> str:
         """Extract string content from message."""

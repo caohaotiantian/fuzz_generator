@@ -234,7 +234,9 @@ class TestTwoPhaseWorkflow:
         assert "</Secray>" in xml
         assert '<DataModel name="Test"/>' in xml
 
-    def test_wrap_xml_removes_existing_declaration(self, mock_settings, mock_mcp_client, tmp_path: Path):
+    def test_wrap_xml_removes_existing_declaration(
+        self, mock_settings, mock_mcp_client, tmp_path: Path
+    ):
         """Test XML wrapping removes existing declaration."""
         workflow = TwoPhaseWorkflow(
             settings=mock_settings,
@@ -245,7 +247,7 @@ class TestTwoPhaseWorkflow:
 
         xml = workflow._wrap_xml('<?xml version="1.0"?><DataModel name="Test"/>')
         # Should only have one declaration
-        assert xml.count('<?xml') == 1
+        assert xml.count("<?xml") == 1
 
 
 class TestTwoPhaseWorkflowIntegration:
@@ -282,16 +284,12 @@ class TestTwoPhaseWorkflowIntegration:
         )
 
     @pytest.mark.asyncio
-    async def test_run_returns_task_result(
-        self, mock_settings, sample_task, tmp_path: Path
-    ):
+    async def test_run_returns_task_result(self, mock_settings, sample_task, tmp_path: Path):
         """Test that run returns TaskResult."""
         mock_mcp_client = MagicMock()
 
         # Patch CustomModelClient to avoid actual LLM calls
-        with patch(
-            "fuzz_generator.agents.autogen_agents.CustomModelClient"
-        ) as mock_client_class:
+        with patch("fuzz_generator.agents.autogen_agents.CustomModelClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client.close = AsyncMock()
             mock_client_class.return_value = mock_client
@@ -304,11 +302,13 @@ class TestTwoPhaseWorkflowIntegration:
             )
 
             # Patch internal methods
-            workflow._run_analysis_phase = AsyncMock(return_value={
-                "status": "success",
-                "function": {"name": "process_request"},
-                "parameters": [],
-            })
+            workflow._run_analysis_phase = AsyncMock(
+                return_value={
+                    "status": "success",
+                    "function": {"name": "process_request"},
+                    "parameters": [],
+                }
+            )
             workflow._run_generation_phase = AsyncMock(
                 return_value='<DataModel name="RequestModel"/>'
             )
@@ -319,15 +319,11 @@ class TestTwoPhaseWorkflowIntegration:
             assert result.task_id == "test_task"
 
     @pytest.mark.asyncio
-    async def test_run_handles_analysis_failure(
-        self, mock_settings, sample_task, tmp_path: Path
-    ):
+    async def test_run_handles_analysis_failure(self, mock_settings, sample_task, tmp_path: Path):
         """Test that run handles analysis phase failure."""
         mock_mcp_client = MagicMock()
 
-        with patch(
-            "fuzz_generator.agents.autogen_agents.CustomModelClient"
-        ) as mock_client_class:
+        with patch("fuzz_generator.agents.autogen_agents.CustomModelClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client.close = AsyncMock()
             mock_client_class.return_value = mock_client
@@ -347,4 +343,3 @@ class TestTwoPhaseWorkflowIntegration:
             assert isinstance(result, TaskResult)
             assert result.success is False
             assert len(result.errors) > 0
-

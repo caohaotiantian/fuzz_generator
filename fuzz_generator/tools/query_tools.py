@@ -144,7 +144,7 @@ async def get_function_code(
         client: MCP HTTP client instance
         function_name: Name of the function
         project_name: Name of the project
-        file_name: Optional file name to narrow search
+        file_name: Optional file name to narrow search (regex pattern)
 
     Returns:
         FunctionCodeResult with function code
@@ -159,7 +159,8 @@ async def get_function_code(
         "project_name": project_name,
     }
     if file_name:
-        arguments["file_name"] = file_name
+        # MCP Server expects 'file_filter' parameter
+        arguments["file_filter"] = file_name
 
     try:
         result = await client.call_tool("get_function_code", arguments)
@@ -234,14 +235,16 @@ async def list_functions(
     project_name: str,
     file_name: str | None = None,
     pattern: str | None = None,
+    limit: int = 100,
 ) -> FunctionListResult:
     """List functions in a project.
 
     Args:
         client: MCP HTTP client instance
         project_name: Name of the project
-        file_name: Optional file to filter by
-        pattern: Optional function name pattern
+        file_name: Optional file to filter by (not supported by MCP server, ignored)
+        pattern: Optional function name pattern (regex)
+        limit: Maximum number of functions to return
 
     Returns:
         FunctionListResult with function list
@@ -251,11 +254,14 @@ async def list_functions(
     """
     logger.info(f"Listing functions in project: {project_name}")
 
-    arguments: dict[str, Any] = {"project_name": project_name}
-    if file_name:
-        arguments["file_name"] = file_name
+    arguments: dict[str, Any] = {
+        "project_name": project_name,
+        "limit": limit,
+    }
+    # MCP Server expects 'name_filter' parameter
     if pattern:
-        arguments["pattern"] = pattern
+        arguments["name_filter"] = pattern
+    # Note: file_name parameter is not supported by MCP server, ignored
 
     try:
         result = await client.call_tool("list_functions", arguments)
@@ -302,15 +308,17 @@ async def search_code(
     pattern: str,
     file_name: str | None = None,
     case_sensitive: bool = True,
+    scope: str = "all",
 ) -> SearchCodeResult:
     """Search for code patterns.
 
     Args:
         client: MCP HTTP client instance
         project_name: Name of the project
-        pattern: Search pattern (regex or literal)
-        file_name: Optional file to search in
-        case_sensitive: Whether search is case sensitive
+        pattern: Search pattern (regex)
+        file_name: Optional file to search in (not supported by MCP server, ignored)
+        case_sensitive: Whether search is case sensitive (not supported by MCP server, ignored)
+        scope: Search scope - "all" (calls and identifiers), "calls", "identifiers"
 
     Returns:
         SearchCodeResult with matches
@@ -323,10 +331,9 @@ async def search_code(
     arguments: dict[str, Any] = {
         "project_name": project_name,
         "pattern": pattern,
-        "case_sensitive": case_sensitive,
+        "scope": scope,
     }
-    if file_name:
-        arguments["file_name"] = file_name
+    # Note: file_name and case_sensitive are not supported by MCP server, ignored
 
     try:
         result = await client.call_tool("search_code", arguments)
