@@ -1,6 +1,34 @@
+# 分析结果和日志
 .fuzz_generator/
+
+# 临时输出文件
+out*.xml
+output*.xml
+*.xml.bak
+
+# Python 缓存和构建
 *.egg-info/
-.coverage
-uv.lock
 **/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.coverage
+htmlcov/
+dist/
+build/
+
+# 虚拟环境
 venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 依赖锁文件
+uv.lock

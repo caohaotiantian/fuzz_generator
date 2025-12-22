@@ -560,9 +560,6 @@ class TwoPhaseWorkflow:
             timeout=settings.llm.timeout,
         )
 
-        # Tools will be created in _run_analysis_phase with task-specific source_file
-        # self.tools = create_analysis_tools(mcp_client, project_name)
-
         # Tool call cache and tracking (Optimization 1)
         self.tool_call_cache: dict[str, Any] = {}  # Cache for tool results
         self.tool_call_counts: dict[str, int] = {}  # Track call counts per tool+params
@@ -948,7 +945,7 @@ class TwoPhaseWorkflow:
             # Get content for all message types
             content = getattr(msg, "content", None)
 
-            # Debug: log message type and full content (no truncation)
+            # Log message details for debugging (full content without truncation)
             if content:
                 content_str = str(content)
                 logger.debug(f"Message type: {msg_type}, content length: {len(content_str)}")
