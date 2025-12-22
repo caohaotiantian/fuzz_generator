@@ -213,9 +213,7 @@ def create_analysis_tools(
         )
         if result.success:
             file_info = f" (from {result.file})" if result.file else ""
-            code_length = len(result.code)
-            line_count = len(result.code.splitlines()) if result.code else 0
-            return f"函数 {function_name} 的源代码{file_info} ({code_length} 字符, {line_count} 行):\n{result.code}"
+            return f"函数 {function_name} 的源代码{file_info}:\n{result.code}"
         return f"Error: {result.error}"
 
     async def list_functions(file_path: str | None = None) -> str:
