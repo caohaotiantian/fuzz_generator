@@ -11,8 +11,10 @@ The workflow is sequential and deterministic:
 2. ModelGenerator generates XML based on analysis results
 """
 
+import functools
 import json
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -171,7 +173,11 @@ MODEL_COMPLETE
 
 
 def create_analysis_tools(
-    mcp_client: MCPHttpClient, project_name: str, source_file: str | None = None
+    mcp_client: MCPHttpClient,
+    project_name: str,
+    source_file: str | None = None,
+    project_path: Any = None,
+    cache_wrapper: Callable[[Callable, str], Callable] | None = None,
 ) -> list:
     """Create all analysis tool functions for AnalysisAgent.
 
@@ -179,6 +185,8 @@ def create_analysis_tools(
         mcp_client: MCP HTTP client instance
         project_name: Active project name in Joern
         source_file: Optional source file to narrow function search
+        project_path: Optional project root path for reading complete source files
+        cache_wrapper: Optional function to wrap tools with caching
 
     Returns:
         List of tool functions
@@ -195,11 +203,19 @@ def create_analysis_tools(
         """
         from fuzz_generator.tools.query_tools import get_function_code as _get_func
 
-        # Pass source_file to narrow search if specified
-        result = await _get_func(mcp_client, function_name, project_name, file_name=source_file)
+        # Pass source_file to narrow search if specified, and project_path for complete code
+        result = await _get_func(
+            mcp_client,
+            function_name,
+            project_name,
+            file_name=source_file,
+            project_path=project_path,
+        )
         if result.success:
             file_info = f" (from {result.file})" if result.file else ""
-            return f"函数 {function_name} 的源代码{file_info}:\n{result.code}"
+            code_length = len(result.code)
+            line_count = len(result.code.splitlines()) if result.code else 0
+            return f"函数 {function_name} 的源代码{file_info} ({code_length} 字符, {line_count} 行):\n{result.code}"
         return f"Error: {result.error}"
 
     async def list_functions(file_path: str | None = None) -> str:
@@ -230,11 +246,14 @@ def create_analysis_tools(
         Returns:
             JSON string of search results
         """
+        from dataclasses import asdict
+
         from fuzz_generator.tools.query_tools import search_code as _search
 
         result = await _search(mcp_client, project_name, pattern)
         if result.success:
-            return f"搜索结果:\n{json.dumps(result.results, indent=2, ensure_ascii=False)}"
+            matches = [asdict(m) for m in result.matches]
+            return f"搜索结果 ({result.count} 个匹配):\n{json.dumps(matches, indent=2, ensure_ascii=False)}"
         return f"Error: {result.error}"
 
     async def track_dataflow(source_method: str, sink_method: str) -> str:
@@ -326,7 +345,8 @@ def create_analysis_tools(
             return f"{function_name} 的控制流图:\n{json.dumps(cfg, indent=2, ensure_ascii=False)}"
         return f"Error: {result.error}"
 
-    return [
+    # Apply cache wrapper if provided (Optimization 1)
+    tools = [
         get_function_code,
         list_functions,
         search_code,
@@ -335,6 +355,14 @@ def create_analysis_tools(
         get_callees,
         get_control_flow_graph,
     ]
+
+    if cache_wrapper:
+        # Wrap each tool with caching
+        # functools.wraps in cache_wrapper preserves all metadata
+        wrapped_tools = [cache_wrapper(tool, tool.__name__) for tool in tools]
+        return wrapped_tools
+
+    return tools
 
 
 # ============================================================================
@@ -467,9 +495,11 @@ class OutputValidator:
 
     @staticmethod
     def validate_analysis_result(data: dict) -> bool:
-        """Validate analysis result structure."""
-        required = ["status", "function", "parameters"]
-        return all(key in data for key in required)
+        """Validate analysis result structure (supports both old and new format)."""
+        has_status = "status" in data
+        has_function = "function_info" in data or "function" in data
+        has_parameters = "parameters" in data
+        return has_status and has_function and has_parameters
 
 
 # ============================================================================
@@ -493,6 +523,7 @@ class TwoPhaseWorkflow:
         project_name: str,
         custom_knowledge: str = "",
         storage_path: Path | None = None,
+        project_path: Any = None,
     ):
         """Initialize workflow.
 
@@ -502,12 +533,14 @@ class TwoPhaseWorkflow:
             project_name: Active project name
             custom_knowledge: Custom background knowledge
             storage_path: Path for storing intermediate results
+            project_path: Project root path for reading complete source files
         """
         self.settings = settings
         self.mcp_client = mcp_client
         self.project_name = project_name
         self.custom_knowledge = custom_knowledge
         self.storage_path = storage_path
+        self.project_path = project_path
 
         # Load prompts
         self.prompt_loader = PromptLoader()
@@ -524,6 +557,11 @@ class TwoPhaseWorkflow:
 
         # Tools will be created in _run_analysis_phase with task-specific source_file
         # self.tools = create_analysis_tools(mcp_client, project_name)
+
+        # Tool call cache and tracking (Optimization 1)
+        self.tool_call_cache: dict[str, Any] = {}  # Cache for tool results
+        self.tool_call_counts: dict[str, int] = {}  # Track call counts per tool+params
+        self.max_same_tool_calls = 3  # Maximum repeated calls with same params
 
         # Conversation recorder
         self.recorder = ConversationRecorder(storage_path)
@@ -543,6 +581,158 @@ class TwoPhaseWorkflow:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Async context manager exit - ensures cleanup."""
         await self.close()
+
+    def _validate_analysis_result(self, result: dict[str, Any]) -> tuple[bool, list[str]]:
+        """Validate analysis result completeness and quality (Optimization 4).
+
+        Args:
+            result: Analysis result dictionary
+
+        Returns:
+            Tuple of (is_valid, warnings_list)
+        """
+        warnings = []
+
+        # Check required top-level fields
+        if "function_info" not in result:
+            warnings.append("缺少 function_info 字段")
+            return False, warnings
+
+        if "parameters" not in result:
+            warnings.append("缺少 parameters 字段")
+
+        if "status" not in result:
+            warnings.append("缺少 status 字段")
+
+        # Check function_info completeness
+        func_info = result.get("function_info", {})
+
+        if not func_info.get("name"):
+            warnings.append("function_info.name 为空")
+
+        source_code_status = func_info.get("source_code_status", "unavailable")
+        if source_code_status == "unavailable":
+            warnings.append("未获取到源代码")
+        elif source_code_status == "partial":
+            warnings.append("源代码不完整")
+
+        if not func_info.get("source_code"):
+            warnings.append("source_code 字段为空")
+
+        # Check parameters
+        params = result.get("parameters", [])
+        if not params:
+            warnings.append("未识别任何函数参数")
+        else:
+            for i, param in enumerate(params):
+                if not param.get("name"):
+                    warnings.append(f"参数 {i} 缺少 name 字段")
+                if not param.get("type"):
+                    warnings.append(f"参数 '{param.get('name', i)}' 缺少 type 字段")
+                if "data_flow" not in param:
+                    warnings.append(f"参数 '{param.get('name', i)}' 缺少数据流分析")
+
+        # Check callees
+        if "callees" not in result or not result["callees"]:
+            warnings.append("未分析函数调用关系")
+
+        # Check confidence
+        confidence = result.get("confidence", 0.0)
+        if not isinstance(confidence, (int, float)):
+            warnings.append("confidence 字段类型错误")
+            confidence = 0.0
+
+        if confidence < 0.3:
+            warnings.append(f"分析置信度过低: {confidence}")
+        elif confidence < 0.6:
+            warnings.append(f"分析置信度较低: {confidence}")
+
+        # Determine overall validity
+        # Valid if:
+        # 1. No critical errors (has function_info with name)
+        # 2. Confidence >= 0.5 OR has parameters
+        is_valid = (
+            func_info.get("name")
+            and (confidence >= 0.5 or params)
+            and result.get("status") != "failed"
+        )
+
+        return is_valid, warnings
+
+    def _create_cached_tool(
+        self,
+        tool_func: Callable[..., Awaitable[str]],
+        tool_name: str,
+    ) -> Callable[..., Awaitable[str]]:
+        """Create a cached version of a tool function.
+
+        Implements caching and call count limiting to prevent redundant tool calls.
+
+        Args:
+            tool_func: Original async tool function
+            tool_name: Name of the tool for logging
+
+        Returns:
+            Wrapped tool function with caching and limiting
+        """
+
+        @functools.wraps(tool_func)
+        async def cached_tool(*args: Any, **kwargs: Any) -> str:
+            # Generate cache key from tool name and arguments
+            # Convert args to dict based on function signature for consistent caching
+            cache_key = f"{tool_name}:{json.dumps(kwargs, sort_keys=True)}"
+
+            # Check cache
+            if cache_key in self.tool_call_cache:
+                logger.info(f"🔄 使用缓存结果: {tool_name} (参数: {kwargs})")
+                return self.tool_call_cache[cache_key]
+
+            # Track call count for this specific tool+params combination
+            self.tool_call_counts[cache_key] = self.tool_call_counts.get(cache_key, 0) + 1
+            call_count = self.tool_call_counts[cache_key]
+
+            # Check if exceeded maximum calls
+            if call_count > self.max_same_tool_calls:
+                error_msg = (
+                    f"⚠️ 工具 '{tool_name}' 已被调用 {call_count} 次（参数: {kwargs}），"
+                    f"超过限制 ({self.max_same_tool_calls})。\n"
+                    f"建议：\n"
+                    f"  1. 如果结果看起来不完整，尝试使用其他工具组合获取信息\n"
+                    f"  2. 使用 search_code 搜索相关代码片段\n"
+                    f"  3. 使用 get_callees 了解函数调用关系\n"
+                    f"  4. 基于已有部分信息继续分析，在结果中标注数据不完整"
+                )
+                logger.warning(error_msg)
+                return error_msg
+
+            # Log warning if approaching limit
+            if call_count == self.max_same_tool_calls:
+                logger.warning(
+                    f"⚠️ 工具 '{tool_name}' 即将达到调用限制 "
+                    f"({call_count}/{self.max_same_tool_calls})"
+                )
+
+            # Execute tool
+            try:
+                result = await tool_func(*args, **kwargs)
+
+                # Cache successful result
+                self.tool_call_cache[cache_key] = result
+
+                logger.debug(
+                    f"✅ 工具调用成功: {tool_name} "
+                    f"(第 {call_count} 次，结果长度: {len(result)} 字符)"
+                )
+
+                return result
+
+            except Exception as e:
+                error_msg = f"工具调用失败: {tool_name}\n错误: {str(e)}"
+                logger.error(error_msg)
+                # Don't cache errors
+                return error_msg
+
+        return cached_tool
 
     def _get_prompt(self, agent_name: str, fallback: str) -> str:
         """Get prompt from YAML or fallback."""
@@ -629,8 +819,14 @@ class TwoPhaseWorkflow:
         system_prompt = self._get_prompt("analysis_agent", DEFAULT_ANALYSIS_AGENT_PROMPT)
 
         # Create tools with task-specific source_file for precise function lookup
+        # Apply caching wrapper to prevent redundant tool calls (Optimization 1)
+        # Pass project_path to enable reading complete source code directly from files
         tools = create_analysis_tools(
-            self.mcp_client, self.project_name, source_file=task.source_file
+            self.mcp_client,
+            self.project_name,
+            source_file=task.source_file,
+            project_path=self.project_path,
+            cache_wrapper=self._create_cached_tool,
         )
 
         # Create AnalysisAgent with all tools
@@ -811,7 +1007,9 @@ class TwoPhaseWorkflow:
                 # Check for tool result pattern in string format (legacy format)
                 # Format: content='...' name='tool_name' call_id='xxx' is_error=False
                 if "call_id=" in content and "is_error=" in content:
-                    logger.debug(f"Detected legacy tool result pattern in content (length={len(content)})")
+                    logger.debug(
+                        f"Detected legacy tool result pattern in content (length={len(content)})"
+                    )
                     self._parse_tool_result_string(agent_name, content)
                     # Extract and record only the actual content
                     content_match = re.search(r"content=['\"](.+?)['\"] name=", content, re.DOTALL)
@@ -907,7 +1105,7 @@ class TwoPhaseWorkflow:
         return content
 
     def _extract_analysis_result(self, result: Any) -> dict[str, Any] | None:
-        """Extract analysis JSON from agent result."""
+        """Extract and validate analysis JSON from agent result (Optimization 4)."""
         if not hasattr(result, "messages"):
             return None
 
@@ -917,6 +1115,25 @@ class TwoPhaseWorkflow:
             if "ANALYSIS_COMPLETE" in content or "status" in content:
                 json_data = self.validator.extract_json(content)
                 if json_data and self.validator.validate_analysis_result(json_data):
+                    # Validate result completeness and quality (Optimization 4)
+                    is_valid, warnings = self._validate_analysis_result(json_data)
+
+                    if warnings:
+                        logger.warning(f"分析结果存在 {len(warnings)} 个质量问题:")
+                        for w in warnings:
+                            logger.warning(f"  - {w}")
+
+                        # Add warnings to result
+                        if "analysis_notes" not in json_data:
+                            json_data["analysis_notes"] = []
+                        json_data["analysis_notes"].extend([f"质量问题: {w}" for w in warnings])
+                        json_data["quality_warnings"] = warnings
+
+                    if not is_valid:
+                        logger.error("分析结果验证失败，但仍然返回部分结果")
+                        if "status" not in json_data:
+                            json_data["status"] = "partial"
+
                     return json_data
 
         # Fallback: try to extract any JSON from any message
@@ -924,6 +1141,16 @@ class TwoPhaseWorkflow:
             content = self._extract_content(msg)
             json_data = self.validator.extract_json(content)
             if json_data:
+                logger.warning("从消息中提取到 JSON，但没有 ANALYSIS_COMPLETE 标记")
+
+                # Still validate even without marker
+                is_valid, warnings = self._validate_analysis_result(json_data)
+                if warnings:
+                    json_data["quality_warnings"] = warnings
+                    if "analysis_notes" not in json_data:
+                        json_data["analysis_notes"] = []
+                    json_data["analysis_notes"].extend([f"质量问题: {w}" for w in warnings])
+
                 return json_data
 
         return None
@@ -1005,12 +1232,13 @@ async def run_single_agent_analysis(
     task: AnalysisTask,
     custom_knowledge: str = "",
     storage_path: Path | None = None,
+    project_path: Any = None,
 ) -> TaskResult:
     """Run a simplified single-agent analysis.
 
     Fallback when full workflow is not needed.
     """
     async with TwoPhaseWorkflow(
-        settings, mcp_client, project_name, custom_knowledge, storage_path
+        settings, mcp_client, project_name, custom_knowledge, storage_path, project_path
     ) as workflow:
         return await workflow.run(task, verbose=False)

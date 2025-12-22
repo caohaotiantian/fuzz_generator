@@ -282,6 +282,7 @@ class AnalysisRunner:
                     project_name=effective_project_name,
                     custom_knowledge=custom_knowledge,
                     storage_path=self.work_dir,
+                    project_path=project_path,
                 ) as runner:
                     result = await runner.run_analysis(task, verbose=self.verbose)
 

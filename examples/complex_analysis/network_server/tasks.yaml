@@ -1,0 +1,22 @@
+project_path: "./examples/complex_analysis/network_server"
+tasks:
+  - source_file: "packet_handler.c"
+    function_name: "process_packet"
+    output_name: "process_packetModel"
+    
+  - source_file: "protocol.c"
+    function_name: "parse_auth_request"
+    output_name: "parse_auth_requestModel"
+    
+  - source_file: "protocol.c"
+    function_name: "parse_data_payload"
+    output_name: "parse_data_payloadModel"
+    
+  - source_file: "protocol.c"
+    function_name: "parse_control_command"
+    output_name: "parse_control_commandModel"
+    
+  - source_file: "protocol.c"
+    function_name: "validate_packet_header"
+    output_name: "validate_packet_headerModel"
+

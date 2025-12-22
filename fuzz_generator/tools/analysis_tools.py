@@ -8,6 +8,7 @@ This module provides wrapper functions for code analysis MCP tools:
 - analyze_variable_flow: Analyze variable data flow
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,39 @@ if TYPE_CHECKING:
     from fuzz_generator.tools.mcp_client import MCPHttpClient
 
 logger = get_logger(__name__)
+
+
+def _ensure_dict_response(data: Any, tool_name: str) -> dict | None:
+    """Ensure MCP tool response is a dictionary.
+
+    Args:
+        data: Response data from MCP tool
+        tool_name: Name of the tool (for error logging)
+
+    Returns:
+        Parsed dictionary or None if parsing fails
+    """
+    logger.debug(f"[{tool_name}] 原始 data 类型: {type(data)}")
+    logger.debug(f"[{tool_name}] 原始 data 内容: {str(data)}")
+
+    # Handle case where data might be a string (needs JSON parsing)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+            logger.debug(f"[{tool_name}] JSON 解析成功，解析后类型: {type(data)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse {tool_name} response as JSON: {e}")
+            logger.error(f"Raw data: {data}")
+            return None
+
+    # Ensure data is a dictionary
+    if not isinstance(data, dict):
+        logger.error(f"Unexpected {tool_name} response type: {type(data)}")
+        logger.error(f"Data content: {data}")
+        return None
+
+    logger.debug(f"[{tool_name}] 最终 data keys: {list(data.keys())}")
+    return data
 
 
 @dataclass
@@ -246,7 +280,13 @@ async def track_dataflow(
                 error=result.error or "Failed to track dataflow",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "track_dataflow")
+        if data is None:
+            return DataFlowResult(
+                success=False,
+                error="Invalid response format from MCP server",
+            )
+
         flows_data = data.get("flows", [])
 
         flows = []
@@ -311,7 +351,14 @@ async def get_callers(
                 error=result.error or "Failed to get callers",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "get_callers")
+        if data is None:
+            return CallersResult(
+                success=False,
+                function=function_name,
+                error="Invalid response format from MCP server",
+            )
+
         callers_data = data.get("callers", [])
 
         callers = []
@@ -377,11 +424,25 @@ async def get_callees(
                 error=result.error or "Failed to get callees",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "get_callees")
+        if data is None:
+            return CalleesResult(
+                success=False,
+                function=function_name,
+                error="Invalid response format from MCP server",
+            )
+
         callees_data = data.get("callees", [])
+        logger.debug(
+            f"[get_callees] callees_data 类型: {type(callees_data)}, 长度: {len(callees_data) if isinstance(callees_data, list) else 'N/A'}"
+        )
 
         callees = []
-        for callee in callees_data:
+        for i, callee in enumerate(callees_data):
+            logger.debug(f"[get_callees] callee[{i}] 类型: {type(callee)}, 内容: {callee}")
+            if not isinstance(callee, dict):
+                logger.error(f"[get_callees] callee[{i}] 不是字典: {type(callee)}")
+                continue
             callees.append(
                 CalleeInfo(
                     name=callee.get("name", ""),
@@ -442,7 +503,13 @@ async def get_control_flow_graph(
                 error=result.error or "Failed to get CFG",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "get_control_flow_graph")
+        if data is None:
+            return ControlFlowResult(
+                success=False,
+                function=function_name,
+                error="Invalid response format from MCP server",
+            )
 
         # Parse nodes
         nodes_data = data.get("nodes", [])
@@ -526,7 +593,14 @@ async def analyze_variable_flow(
                 error=result.error or "Failed to analyze variable flow",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "analyze_variable_flow")
+        if data is None:
+            return VariableFlowResult(
+                success=False,
+                variable=variable_name,
+                error="Invalid response format from MCP server",
+            )
+
         return VariableFlowResult(
             success=data.get("success", True),
             variable=data.get("variable", variable_name),

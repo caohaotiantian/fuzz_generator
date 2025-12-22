@@ -20,6 +20,32 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _ensure_dict_response(data: Any, tool_name: str) -> dict | None:
+    """Ensure MCP tool response is a dictionary.
+
+    Args:
+        data: Response data from MCP tool
+        tool_name: Name of the tool (for error logging)
+
+    Returns:
+        Parsed dictionary or None if parsing fails
+    """
+    # Handle case where data might be a string (needs JSON parsing)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse {tool_name} response as JSON: {data}")
+            return None
+
+    # Ensure data is a dictionary
+    if not isinstance(data, dict):
+        logger.error(f"Unexpected {tool_name} response type: {type(data)}, data: {data}")
+        return None
+
+    return data
+
+
 @dataclass
 class FunctionCodeResult:
     """Result of get_function_code operation.
@@ -137,6 +163,7 @@ async def get_function_code(
     function_name: str,
     project_name: str,
     file_name: str | None = None,
+    project_path: Any = None,
 ) -> FunctionCodeResult:
     """Get source code of a function.
 
@@ -145,6 +172,7 @@ async def get_function_code(
         function_name: Name of the function
         project_name: Name of the project
         file_name: Optional file name to narrow search (regex pattern)
+        project_path: Optional project root path for reading complete source files
 
     Returns:
         FunctionCodeResult with function code
@@ -172,42 +200,131 @@ async def get_function_code(
                 error=result.error or "Failed to get function code",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "get_function_code")
+        if data is None:
+            return FunctionCodeResult(
+                success=False,
+                function_name=function_name,
+                error="Invalid response format from MCP server",
+            )
+
+        logger.info(f"[DEBUG] MCP 返回的原始数据长度: {len(str(data))} 字符")
+        logger.info(f"[DEBUG] MCP 返回的 data keys: {list(data.keys())}")
 
         # Handle the joern_mcp response format:
         # {"success": true, "project": "...", "functions": [{"code": "..."}], "count": 1}
         functions = data.get("functions", [])
+        logger.info(f"[DEBUG] functions 数量: {len(functions)}")
         if functions:
             func_data = functions[0]
-            code_str = func_data.get("code", "")
+            logger.info(f"[DEBUG] func_data keys: {list(func_data.keys())}")
 
-            # Handle double-encoded JSON string
-            if code_str.startswith('""') and code_str.endswith('""'):
-                code_str = code_str[2:-2]  # Remove outer quotes
+            # Extract metadata from Joern
+            filename = func_data.get("filename", "")
+            line_number = func_data.get("lineNumber", 0)
+            end_line = func_data.get("lineNumberEnd", 0)
+            signature = func_data.get("signature", "")
+            func_name = func_data.get("name", function_name)
 
-            # Try to parse as JSON if it looks like an array
-            if code_str.startswith("["):
+            logger.info(
+                f"[DEBUG] 元数据 - filename: {filename}, line_number: {line_number}, end_line: {end_line}"
+            )
+            logger.info(f"[DEBUG] project_path: {project_path}")
+
+            # Try to read complete code from source file if project_path is provided
+            complete_code = None
+            if project_path and filename and line_number > 0 and end_line > 0:
                 try:
-                    parsed = json.loads(code_str)
-                    if parsed and isinstance(parsed, list) and len(parsed) > 0:
-                        func_info = parsed[0]
-                        return FunctionCodeResult(
-                            success=True,
-                            function_name=func_info.get("name", function_name),
-                            code=func_info.get("code", ""),
-                            file=func_info.get("filename", ""),
-                            line_number=func_info.get("lineNumber", 0),
-                            end_line=func_info.get("lineNumberEnd", 0),
-                            signature=func_info.get("signature", ""),
-                        )
-                except json.JSONDecodeError:
-                    pass
+                    from pathlib import Path
 
-            # Fallback: use as-is
+                    # Convert project_path to Path object
+                    if isinstance(project_path, str):
+                        project_path = Path(project_path)
+
+                    source_file = project_path / filename
+                    logger.info(f"尝试从源文件读取完整代码: {source_file}")
+
+                    if source_file.exists():
+                        with open(source_file, encoding="utf-8") as f:
+                            lines = f.readlines()
+                            # Line numbers are 1-based, array indices are 0-based
+                            complete_code = "".join(lines[line_number - 1 : end_line])
+                            logger.info(
+                                f"✅ 从源文件读取到完整代码: {len(complete_code)} 字符, {len(complete_code.splitlines())} 行"
+                            )
+                    else:
+                        logger.warning(f"源文件不存在: {source_file}")
+                except Exception as e:
+                    logger.warning(f"从源文件读取代码失败: {e}")
+
+            # Use complete code from source file, or fallback to Joern's code
+            if complete_code:
+                final_code = complete_code
+                logger.info("✅ 使用从源文件读取的完整代码")
+            else:
+                # Fallback to Joern's code (may be truncated)
+                code_str = func_data.get("code", "")
+                logger.info(f"⚠️ 使用 Joern 返回的代码（可能被截断）: {len(code_str)} 字符")
+
+                # Handle multi-level JSON encoding
+                # Sometimes MCP returns: {\"code\": \"\"[{...}]\"\"}
+                while code_str.startswith('""') and code_str.endswith('""') and len(code_str) > 4:
+                    code_str = code_str[2:-2]  # Remove outer double quotes
+
+                # Try to parse as JSON array
+                if code_str.startswith("["):
+                    try:
+                        parsed = json.loads(code_str)
+                        if parsed and isinstance(parsed, list) and len(parsed) > 0:
+                            func_info = parsed[0]
+                            # Update metadata if available
+                            if isinstance(func_info, dict):
+                                filename = func_info.get("filename", filename)
+                                line_number = func_info.get("lineNumber", line_number)
+                                end_line = func_info.get("lineNumberEnd", end_line)
+                                signature = func_info.get("signature", signature)
+                                func_name = func_info.get("name", func_name)
+                                code_str = func_info.get("code", "")
+                                logger.info(
+                                    f"📋 从嵌套 JSON 解析到元数据 - filename: {filename}, line_number: {line_number}, end_line: {end_line}"
+                                )
+
+                                # Now try to read from source file with parsed metadata
+                                if project_path and filename and line_number > 0 and end_line > 0:
+                                    try:
+                                        from pathlib import Path
+
+                                        if isinstance(project_path, str):
+                                            project_path = Path(project_path)
+                                        source_file = project_path / filename
+                                        logger.info(f"尝试从源文件读取完整代码: {source_file}")
+                                        if source_file.exists():
+                                            with open(source_file, encoding="utf-8") as f:
+                                                lines = f.readlines()
+                                                complete_code = "".join(
+                                                    lines[line_number - 1 : end_line]
+                                                )
+                                                logger.info(
+                                                    f"✅ 从源文件读取到完整代码: {len(complete_code)} 字符, {len(complete_code.splitlines())} 行"
+                                                )
+                                                code_str = complete_code
+                                        else:
+                                            logger.warning(f"源文件不存在: {source_file}")
+                                    except Exception as e:
+                                        logger.warning(f"从源文件读取代码失败: {e}")
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"JSON 解析失败: {e}")
+
+                final_code = code_str
+
             return FunctionCodeResult(
                 success=True,
-                function_name=function_name,
-                code=code_str,
+                function_name=func_name,
+                code=final_code,
+                file=filename,
+                line_number=line_number,
+                end_line=end_line,
+                signature=signature,
             )
 
         # Original format fallback
@@ -272,7 +389,13 @@ async def list_functions(
                 error=result.error or "Failed to list functions",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "list_functions")
+        if data is None:
+            return FunctionListResult(
+                success=False,
+                error="Invalid response format from MCP server",
+            )
+
         functions_data = data.get("functions", [])
 
         functions = []
@@ -344,7 +467,13 @@ async def search_code(
                 error=result.error or "Failed to search code",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "search_code")
+        if data is None:
+            return SearchCodeResult(
+                success=False,
+                error="Invalid response format from MCP server",
+            )
+
         matches_data = data.get("matches", [])
 
         matches = []
@@ -409,7 +538,13 @@ async def execute_query(
                 error=result.error or "Failed to execute query",
             )
 
-        data = result.data
+        data = _ensure_dict_response(result.data, "execute_query")
+        if data is None:
+            return QueryResult(
+                success=False,
+                error="Invalid response format from MCP server",
+            )
+
         return QueryResult(
             success=data.get("success", True),
             data=data.get("result"),
