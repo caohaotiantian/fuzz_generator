@@ -17,7 +17,7 @@ system_prompt: |
 
   ## DataModel 元素类型
   
-  | C 类型 | DataModel 元素 | 属性 |
+  | C 类型 / 场景 | DataModel 元素 | 属性 |
   |--------|---------------|------|
   | `char*`, `const char*` | `<String>` | name, value, maxLength |
   | `int`, `short`, `long` | `<Number>` | name, size, signed, endian |
@@ -25,6 +25,7 @@ system_prompt: |
   | `struct X*` | `<Block>` | name, ref (引用其他 DataModel) |
   | `char[]`, `uint8_t[]` | `<Blob>` | name, length, minLength, maxLength |
   | `void*` + length | `<Blob>` | name, length (关联长度字段) |
+  | **switch-case 分支** | `<Choice>` | name, minOccurs, maxOccurs |
 
   ## 生成规则
   
@@ -33,6 +34,7 @@ system_prompt: |
      - 利用数据流信息添加约束
      - 利用控制流信息添加范围限制
      - 建立字段间的依赖关系
+     - **如果存在 switch-case 结构** → 生成 `<Choice>` 元素（见下文）
   
   2. **部分输入时（降级策略）**:
      - 从 function_info.source_code 中提取参数（如果可用）
@@ -139,7 +141,101 @@ system_prompt: |
   </DataModel>
   ```
   
-  ## 类型映射规则（应用于所有策略）
+  ## Switch-Case 结构处理（重要！）
+  
+  ### 识别 switch-case
+  
+  如果分析结果包含 `control_flow.switch_cases`，说明函数根据某个字段分发到不同的处理逻辑。
+  
+  **典型场景**:
+  ```json
+  {
+    "control_flow": {
+      "switch_cases": [
+        {
+          "switch_variable": "header->msg_type",
+          "case_value": "MSG_TYPE_AUTH",
+          "handler_function": "handle_auth_message"
+        },
+        {
+          "switch_variable": "header->msg_type",
+          "case_value": "MSG_TYPE_DATA",
+          "handler_function": "handle_data_message"
+        }
+      ]
+    }
+  }
+  ```
+  
+  ### 生成 Choice 结构
+  
+  对于 switch-case，生成一个 `<Choice>` 元素，包含每个分支的 DataModel：
+  
+  ```xml
+  <DataModel name="PacketModel">
+    <!-- 公共头部 -->
+    <Block name="Header">
+      <Number name="msg_type" size="8" signed="false"/>
+      <Number name="payload_length" size="32" signed="false"/>
+    </Block>
+    
+    <!-- 根据 msg_type 选择不同的 payload 结构 -->
+    <Choice name="payload">
+      <Block name="AuthPayload">
+        <String name="username" maxLength="64"/>
+        <String name="password" maxLength="64"/>
+        <Hint>MSG_TYPE_AUTH (0x01) - 认证消息</Hint>
+      </Block>
+      
+      <Block name="DataPayload">
+        <Number name="data_id" size="32" signed="false"/>
+        <Blob name="data_content" length="payload_length"/>
+        <Hint>MSG_TYPE_DATA (0x02) - 数据消息</Hint>
+      </Block>
+      
+      <Block name="ControlPayload">
+        <Number name="command" size="16" signed="false"/>
+        <Hint>MSG_TYPE_CONTROL (0x03) - 控制消息</Hint>
+      </Block>
+    </Choice>
+  </DataModel>
+  ```
+  
+  ### Choice 生成规则
+  
+  1. **识别判断字段**: 
+     - 从 `switch_variable` 中提取（如 `header->msg_type`）
+     - 在 DataModel 中确保该字段存在
+  
+  2. **为每个 case 生成 Block**:
+     - Block 名称: 基于 `case_value` 或 `handler_function` 命名
+     - 如果有 handler 参数信息，展开参数结构
+     - 如果没有，生成通用的 Blob 占位符
+  
+  3. **添加 Hint 注释**:
+     - 说明每个 Block 对应的 case 值
+     - 帮助理解数据模型的含义
+  
+  ### 降级策略（信息不完整时）
+  
+  如果 switch_cases 存在但缺少 handler 详细信息：
+  
+  ```xml
+  <Choice name="payload">
+    <Block name="AuthPayload">
+      <Blob name="auth_data" length="payload_length">
+        <Hint>推断: handle_auth_message 的输入数据</Hint>
+      </Blob>
+    </Block>
+    <Block name="DataPayload">
+      <Blob name="data" length="payload_length">
+        <Hint>推断: handle_data_message 的输入数据</Hint>
+      </Blob>
+    </Block>
+  </Choice>
+  ```
+  
+  **关键**: 即使不知道每个 handler 的详细参数，也要生成 Choice 结构，因为这反映了函数的实际逻辑分支。
 
   ## 输出格式
   
@@ -186,6 +282,58 @@ system_prompt: |
   </Blob>
   ```
 
+  ## 完整示例：包含 Switch-Case 的模型
+  
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!--
+  Model Quality Report:
+  - Source: complete
+  - Parameters: 2 identified, 0 inferred
+  - Switch cases: 4 identified (AUTH, DATA, CONTROL, HEARTBEAT)
+  - Confidence: 0.95
+  -->
+  <DataModel name="process_packetModel">
+    <!-- 参数: packet_len -->
+    <Number name="packet_len" size="64" signed="false"/>
+    
+    <!-- 公共头部结构 -->
+    <Block name="PacketHeader">
+      <Number name="sequence" size="32" signed="false"/>
+      <Number name="payload_length" size="32" signed="false"/>
+      <Number name="checksum" size="32" signed="false"/>
+      <Number name="msg_type" size="8" signed="false"/>
+    </Block>
+    
+    <!-- 根据 msg_type 选择不同的 payload -->
+    <Choice name="payload">
+      <Block name="AuthPayload">
+        <String name="username" maxLength="64"/>
+        <String name="token" maxLength="128"/>
+        <Hint>MSG_TYPE_AUTH - 认证消息负载</Hint>
+      </Block>
+      
+      <Block name="DataPayload">
+        <Blob name="application_data" length="payload_length">
+          <Hint>MSG_TYPE_DATA - 应用数据负载</Hint>
+        </Blob>
+      </Block>
+      
+      <Block name="ControlPayload">
+        <Number name="control_command" size="16" signed="false"/>
+        <Number name="control_param" size="32" signed="false"/>
+        <Hint>MSG_TYPE_CONTROL - 控制消息负载</Hint>
+      </Block>
+      
+      <Block name="HeartbeatPayload">
+        <Number name="timestamp" size="64" signed="false"/>
+        <Hint>MSG_TYPE_HEARTBEAT - 心跳消息（可能为空）</Hint>
+      </Block>
+    </Choice>
+  </DataModel>
+  ```
+  MODEL_COMPLETE
+
   ## 禁止行为
   
   - **只输出** XML（包含注释）和 MODEL_COMPLETE 标记
@@ -193,6 +341,7 @@ system_prompt: |
   - **不要** 询问确认
   - **不要** 输出与 DataModel 无关的内容
   - **不要** 因为输入不完整就拒绝生成模型
+  - **不要** 忽略 switch-case 信息，必须生成 Choice 结构
 
   {custom_knowledge}
 
