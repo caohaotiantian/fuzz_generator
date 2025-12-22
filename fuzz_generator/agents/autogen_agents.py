@@ -339,11 +339,19 @@ def create_analysis_tools(mcp_client: MCPHttpClient, project_name: str) -> list:
 
 
 class ConversationRecorder:
-    """Records agent conversations for debugging."""
+    """Records agent conversations for debugging.
+
+    Records messages with structured tool call information including:
+    - Agent thinking/reasoning
+    - Tool calls with arguments
+    - Tool results
+    - Final outputs
+    """
 
     def __init__(self, storage_path: Path | None = None):
         self.storage_path = storage_path
         self.messages: list[dict[str, Any]] = []
+        self.tool_calls: list[dict[str, Any]] = []  # Structured tool call log
 
     def record(self, agent_name: str, content: str, role: str = "assistant") -> None:
         """Record a message."""
@@ -358,20 +366,64 @@ class ConversationRecorder:
             }
         )
 
+    def record_tool_call(
+        self,
+        agent_name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        call_id: str | None = None,
+    ) -> None:
+        """Record a tool call with structured arguments."""
+        self.tool_calls.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "type": "tool_call",
+                "agent": agent_name,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "result": None,  # Will be filled by record_tool_result
+            }
+        )
+
+    def record_tool_result(
+        self,
+        call_id: str,
+        result: str,
+        is_error: bool = False,
+    ) -> None:
+        """Record the result of a tool call."""
+        # Find matching tool call and update result
+        for tc in reversed(self.tool_calls):
+            if tc.get("call_id") == call_id:
+                tc["result"] = result[:2000] if len(result) > 2000 else result
+                tc["is_error"] = is_error
+                tc["completed_at"] = datetime.now().isoformat()
+                break
+
     def get_messages(self) -> list[dict[str, Any]]:
         return self.messages
 
+    def get_tool_calls(self) -> list[dict[str, Any]]:
+        return self.tool_calls
+
     async def save(self, task_id: str) -> None:
-        """Save conversation to file."""
+        """Save conversation and tool calls to files."""
         if self.storage_path is None:
             return
 
         intermediate_dir = self.storage_path / "results" / task_id / "intermediate"
         intermediate_dir.mkdir(parents=True, exist_ok=True)
 
+        # Save conversations
         conversations_file = intermediate_dir / "agent_conversations.json"
         conversations_file.write_text(json.dumps(self.messages, indent=2, ensure_ascii=False))
         logger.debug(f"Saved conversation to {conversations_file}")
+
+        # Save structured tool calls
+        tool_calls_file = intermediate_dir / "tool_calls.json"
+        tool_calls_file.write_text(json.dumps(self.tool_calls, indent=2, ensure_ascii=False))
+        logger.debug(f"Saved tool calls to {tool_calls_file}")
 
 
 # ============================================================================
@@ -612,12 +664,9 @@ class TwoPhaseWorkflow:
                     msg_type = type(msg).__name__
                     logger.info(f"[{msg_type}] {source}: {content[:200]}...")
 
-            # Record conversation
+            # Record conversation and tool calls
             if hasattr(result, "messages"):
-                for msg in result.messages:
-                    agent_name = getattr(msg, "source", "unknown")
-                    content = self._extract_content(msg)
-                    self.recorder.record(agent_name, content)
+                self._record_messages_with_tool_calls(result.messages, "AnalysisAgent")
 
             # Extract JSON from the final messages
             return self._extract_analysis_result(result)
@@ -666,12 +715,9 @@ class TwoPhaseWorkflow:
                     msg_type = type(msg).__name__
                     logger.info(f"[Gen] [{msg_type}] {source}: {content[:200]}...")
 
-            # Record conversation
+            # Record conversation (no tool calls in generation phase)
             if hasattr(result, "messages"):
-                for msg in result.messages:
-                    agent_name = getattr(msg, "source", "unknown")
-                    content = self._extract_content(msg)
-                    self.recorder.record(agent_name, content)
+                self._record_messages_with_tool_calls(result.messages, "ModelGenerator")
 
             # Extract XML from result
             return self._extract_xml_result(result)
@@ -679,6 +725,111 @@ class TwoPhaseWorkflow:
         except Exception as e:
             logger.error(f"Generation phase error: {e}")
             return None
+
+    def _record_messages_with_tool_calls(self, messages: list[Any], default_agent: str) -> None:
+        """Record messages and extract structured tool call information.
+
+        Args:
+            messages: List of autogen messages
+            default_agent: Default agent name if not specified in message
+        """
+        for msg in messages:
+            agent_name = getattr(msg, "source", default_agent)
+            msg_type = type(msg).__name__
+
+            # Handle different message types
+            if msg_type == "ToolCallRequestEvent" or hasattr(msg, "content"):
+                content = getattr(msg, "content", None)
+
+                # Check if content contains FunctionCall objects
+                if isinstance(content, list):
+                    for item in content:
+                        if hasattr(item, "name") and hasattr(item, "arguments"):
+                            # This is a FunctionCall
+                            try:
+                                args = (
+                                    json.loads(item.arguments)
+                                    if isinstance(item.arguments, str)
+                                    else item.arguments
+                                )
+                            except json.JSONDecodeError:
+                                args = {"raw": item.arguments}
+
+                            call_id = getattr(item, "id", None)
+                            self.recorder.record_tool_call(
+                                agent_name=agent_name,
+                                tool_name=item.name,
+                                arguments=args,
+                                call_id=call_id,
+                            )
+                        else:
+                            # Regular content item
+                            self.recorder.record(agent_name, str(item))
+                elif isinstance(content, str):
+                    # Check for FunctionCall string pattern
+                    if content.startswith("FunctionCall("):
+                        self._parse_function_call_string(agent_name, content)
+                    else:
+                        self.recorder.record(agent_name, content)
+                elif content is not None:
+                    self.recorder.record(agent_name, str(content))
+
+            # Handle ToolCallResultEvent (tool results)
+            if msg_type == "ToolCallResultEvent" or (
+                hasattr(msg, "content") and hasattr(msg, "call_id")
+            ):
+                call_id = getattr(msg, "call_id", None)
+                content = getattr(msg, "content", "")
+                is_error = getattr(msg, "is_error", False)
+
+                if call_id:
+                    self.recorder.record_tool_result(call_id, str(content), is_error)
+
+            # Also check for result patterns in content string
+            content = getattr(msg, "content", "")
+            if isinstance(content, str) and "call_id=" in content:
+                self._parse_tool_result_string(agent_name, content)
+
+    def _parse_function_call_string(self, agent_name: str, content: str) -> None:
+        """Parse FunctionCall string representation and record it."""
+        # Pattern: FunctionCall(id='xxx', arguments='{"key": "value"}', name='tool_name')
+        id_match = re.search(r"id=['\"]([^'\"]+)['\"]", content)
+        name_match = re.search(r"name=['\"]([^'\"]+)['\"]", content)
+        args_match = re.search(r"arguments=['\"](.+?)['\"](?:,|\))", content)
+
+        if name_match:
+            tool_name = name_match.group(1)
+            call_id = id_match.group(1) if id_match else None
+
+            args = {}
+            if args_match:
+                try:
+                    # Handle escaped JSON
+                    args_str = args_match.group(1).replace('\\"', '"')
+                    args = json.loads(args_str)
+                except json.JSONDecodeError:
+                    args = {"raw": args_match.group(1)}
+
+            self.recorder.record_tool_call(
+                agent_name=agent_name,
+                tool_name=tool_name,
+                arguments=args,
+                call_id=call_id,
+            )
+
+    def _parse_tool_result_string(self, agent_name: str, content: str) -> None:
+        """Parse tool result string and record it."""
+        # Pattern: content='...' name='tool_name' call_id='xxx' is_error=False
+        call_id_match = re.search(r"call_id=['\"]([^'\"]+)['\"]", content)
+        is_error_match = re.search(r"is_error=(True|False)", content)
+        content_match = re.search(r"content=['\"](.+?)['\"] name=", content, re.DOTALL)
+
+        if call_id_match:
+            call_id = call_id_match.group(1)
+            is_error = is_error_match.group(1) == "True" if is_error_match else False
+            result_content = content_match.group(1) if content_match else content
+
+            self.recorder.record_tool_result(call_id, result_content, is_error)
 
     def _extract_content(self, msg: Any) -> str:
         """Extract string content from message."""
