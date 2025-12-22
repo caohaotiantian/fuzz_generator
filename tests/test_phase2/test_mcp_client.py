@@ -1,15 +1,17 @@
-"""Tests for MCP HTTP client."""
+"""Tests for MCP HTTP client.
 
-from unittest.mock import AsyncMock, MagicMock, patch
+These tests primarily test the configuration and data structures.
+Full integration tests require a running MCP server.
+"""
 
-import httpx
+from unittest.mock import MagicMock
+
 import pytest
 
 from fuzz_generator.exceptions import MCPConnectionError
 from fuzz_generator.tools.mcp_client import (
     MCPClientConfig,
     MCPHttpClient,
-    MCPResponse,
     MCPToolResult,
 )
 
@@ -80,25 +82,12 @@ class TestMCPToolResult:
         assert result.success is False
         assert result.error == "Tool call failed"
 
-
-class TestMCPResponse:
-    """Tests for MCPResponse."""
-
-    def test_success_response(self):
-        """Test successful response."""
-        response = MCPResponse(
-            id="req-123",
-            result={"content": [{"type": "text", "text": "data"}]},
-        )
-        assert response.is_success is True
-
-    def test_error_response(self):
-        """Test error response."""
-        response = MCPResponse(
-            id="req-123",
-            error={"code": -32600, "message": "Invalid Request"},
-        )
-        assert response.is_success is False
+    def test_default_values(self):
+        """Test default values."""
+        result = MCPToolResult(success=True)
+        assert result.data == {}
+        assert result.raw_content == ""
+        assert result.error is None
 
 
 class TestMCPHttpClient:
@@ -114,107 +103,12 @@ class TestMCPHttpClient:
             retry_delay=0.1,  # Short delay for tests
         )
 
-    @pytest.mark.asyncio
-    async def test_context_manager_enter(self, config):
-        """Test client initialization via context manager."""
-        async with MCPHttpClient(config) as client:
-            assert client._client is not None
-
-    @pytest.mark.asyncio
-    async def test_context_manager_exit(self, config):
-        """Test client cleanup via context manager."""
+    def test_client_creation(self, config):
+        """Test client can be created."""
         client = MCPHttpClient(config)
-        async with client:
-            pass
-        assert client._client is None
-
-    @pytest.mark.asyncio
-    async def test_call_tool_success(self, config):
-        """Test successful tool call."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "result": {"content": [{"type": "text", "text": '{"success": true, "data": "value"}'}]},
-        }
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
-
-            async with MCPHttpClient(config) as client:
-                result = await client.call_tool("test_tool", {"arg": "value"})
-
-                assert result.success is True
-                assert result.data["success"] is True
-                assert result.data["data"] == "value"
-
-    @pytest.mark.asyncio
-    async def test_call_tool_error_response(self, config):
-        """Test tool call with error response."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "error": {"code": -32600, "message": "Invalid Request"},
-        }
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
-
-            async with MCPHttpClient(config) as client:
-                result = await client.call_tool("test_tool", {})
-
-                assert result.success is False
-                assert "Invalid Request" in result.error
-
-    @pytest.mark.asyncio
-    async def test_call_tool_retry_on_connect_error(self, config):
-        """Test retry on connection error."""
-        call_count = 0
-
-        async def mock_post(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise httpx.ConnectError("Connection failed")
-            response = MagicMock()
-            response.json.return_value = {
-                "jsonrpc": "2.0",
-                "id": "req-123",
-                "result": {"content": [{"type": "text", "text": '{"success": true}'}]},
-            }
-            response.raise_for_status = MagicMock()
-            return response
-
-        with patch.object(httpx.AsyncClient, "post", side_effect=mock_post):
-            async with MCPHttpClient(config) as client:
-                result = await client.call_tool("test_tool", {})
-                assert result.success is True
-                assert call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_call_tool_max_retries_exceeded(self, config):
-        """Test exception when max retries exceeded."""
-        with patch.object(httpx.AsyncClient, "post", side_effect=httpx.ConnectError("Failed")):
-            async with MCPHttpClient(config) as client:
-                with pytest.raises(MCPConnectionError) as exc_info:
-                    await client.call_tool("test_tool", {})
-
-                assert "Failed to connect" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_call_tool_timeout_error(self, config):
-        """Test handling of timeout errors."""
-        with patch.object(
-            httpx.AsyncClient,
-            "post",
-            side_effect=httpx.TimeoutException("Request timed out"),
-        ):
-            async with MCPHttpClient(config) as client:
-                with pytest.raises(MCPConnectionError):
-                    await client.call_tool("test_tool", {})
+        assert client is not None
+        assert client.config == config
+        assert client._session is None
 
     @pytest.mark.asyncio
     async def test_call_tool_not_initialized(self, config):
@@ -224,113 +118,129 @@ class TestMCPHttpClient:
             await client.call_tool("test_tool", {})
 
     @pytest.mark.asyncio
-    async def test_list_tools_success(self, config):
-        """Test listing available tools."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "result": {
-                "tools": [
-                    {"name": "tool1", "description": "desc1"},
-                    {"name": "tool2", "description": "desc2"},
-                ]
-            },
-        }
-        mock_response.raise_for_status = MagicMock()
+    async def test_list_tools_not_initialized(self, config):
+        """Test error when listing tools without initialization."""
+        client = MCPHttpClient(config)
+        with pytest.raises(MCPConnectionError, match="not initialized"):
+            await client.list_tools()
 
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
+    def test_client_initial_state(self, config):
+        """Test client initial state before initialization."""
+        client = MCPHttpClient(config)
+        # Before entering context manager, session should be None
+        assert client._session is None
+        assert client._read is None
+        assert client._write is None
+        assert client._context_stack is None
 
-            async with MCPHttpClient(config) as client:
-                tools = await client.list_tools()
 
-                assert len(tools) == 2
-                assert tools[0]["name"] == "tool1"
-                assert tools[1]["name"] == "tool2"
+class TestMCPHttpClientExtractResult:
+    """Tests for result extraction."""
+
+    @pytest.fixture
+    def config(self):
+        """Create test configuration."""
+        return MCPClientConfig()
+
+    def test_extract_empty_result(self, config):
+        """Test extracting empty result."""
+        client = MCPHttpClient(config)
+
+        mock_result = MagicMock()
+        mock_result.content = []
+
+        tool_result = client._extract_tool_result(mock_result)
+
+        assert tool_result.success is True
+        assert tool_result.data == {}
+        assert tool_result.raw_content == ""
+
+    def test_extract_json_result(self, config):
+        """Test extracting JSON result."""
+        client = MCPHttpClient(config)
+
+        mock_content = MagicMock()
+        mock_content.text = '{"success": true, "data": "value"}'
+
+        mock_result = MagicMock()
+        mock_result.content = [mock_content]
+
+        tool_result = client._extract_tool_result(mock_result)
+
+        assert tool_result.success is True
+        assert tool_result.data == {"success": True, "data": "value"}
+        assert tool_result.raw_content == '{"success": true, "data": "value"}'
+
+    def test_extract_non_json_result(self, config):
+        """Test extracting non-JSON result."""
+        client = MCPHttpClient(config)
+
+        mock_content = MagicMock()
+        mock_content.text = "Plain text response"
+
+        mock_result = MagicMock()
+        mock_result.content = [mock_content]
+
+        tool_result = client._extract_tool_result(mock_result)
+
+        assert tool_result.success is True
+        assert tool_result.data == {"raw": "Plain text response"}
+        assert tool_result.raw_content == "Plain text response"
+
+    def test_extract_no_content_attribute(self, config):
+        """Test extracting result with no content attribute."""
+        client = MCPHttpClient(config)
+
+        mock_result = MagicMock(spec=[])  # No content attribute
+
+        tool_result = client._extract_tool_result(mock_result)
+
+        assert tool_result.success is True
+        assert tool_result.data == {}
+
+
+class TestMCPHttpClientIntegration:
+    """Integration tests that require mocking MCP session."""
+
+    @pytest.fixture
+    def config(self):
+        """Create test configuration."""
+        return MCPClientConfig(
+            url="http://localhost:8000/mcp",
+            timeout=30,
+            retry_count=1,
+            retry_delay=0.01,
+        )
 
     @pytest.mark.asyncio
-    async def test_list_tools_error(self, config):
-        """Test list tools with error response."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "error": {"code": -32600, "message": "Error"},
-        }
-        mock_response.raise_for_status = MagicMock()
+    async def test_ping_when_session_fails(self, config):
+        """Test ping returns False when not connected."""
+        client = MCPHttpClient(config)
+        # Not initialized, should return False
+        result = await client.ping()
+        assert result is False
 
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
 
-            async with MCPHttpClient(config) as client:
-                tools = await client.list_tools()
-                assert tools == []
+class TestMCPClientConfigValidation:
+    """Tests for configuration validation."""
 
-    @pytest.mark.asyncio
-    async def test_ping_success(self, config):
-        """Test successful ping."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "result": {"tools": [{"name": "tool1"}]},
-        }
-        mock_response.raise_for_status = MagicMock()
+    def test_very_long_timeout(self):
+        """Test configuration with very long timeout."""
+        config = MCPClientConfig(timeout=3600)
+        assert config.timeout == 3600
 
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
+    def test_zero_retry_count(self):
+        """Test configuration with zero retries."""
+        config = MCPClientConfig(retry_count=0)
+        assert config.retry_count == 0
 
-            async with MCPHttpClient(config) as client:
-                result = await client.ping()
-                assert result is True
-
-    @pytest.mark.asyncio
-    async def test_ping_failure(self, config):
-        """Test failed ping."""
-        with patch.object(httpx.AsyncClient, "post", side_effect=httpx.ConnectError("Failed")):
-            async with MCPHttpClient(config) as client:
-                result = await client.ping()
-                assert result is False
-
-    @pytest.mark.asyncio
-    async def test_parse_non_json_response(self, config):
-        """Test handling of non-JSON response content."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "result": {"content": [{"type": "text", "text": "Plain text response"}]},
-        }
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
-
-            async with MCPHttpClient(config) as client:
-                result = await client.call_tool("test_tool", {})
-
-                assert result.success is True
-                assert result.data == {"raw": "Plain text response"}
-                assert result.raw_content == "Plain text response"
-
-    @pytest.mark.asyncio
-    async def test_empty_response_content(self, config):
-        """Test handling of empty response content."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "jsonrpc": "2.0",
-            "id": "req-123",
-            "result": {"content": []},
-        }
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = mock_response
-
-            async with MCPHttpClient(config) as client:
-                result = await client.call_tool("test_tool", {})
-
-                assert result.success is True
-                assert result.data == {}
-                assert result.raw_content == ""
+    def test_custom_headers(self):
+        """Test configuration with custom headers."""
+        config = MCPClientConfig(
+            headers={
+                "Authorization": "Bearer token",
+                "X-Custom-Header": "value",
+            }
+        )
+        assert "Authorization" in config.headers
+        assert "X-Custom-Header" in config.headers

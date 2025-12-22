@@ -90,7 +90,7 @@ class MCPHttpClient:
             from contextlib import AsyncExitStack
 
             from mcp import ClientSession
-            from mcp.client.streamable_http import streamablehttp_client
+            from mcp.client.streamable_http import streamable_http_client
         except ImportError as e:
             raise MCPConnectionError(
                 "MCP SDK not available. Please install: pip install mcp",
@@ -111,7 +111,7 @@ class MCPHttpClient:
                 self._write,
                 _get_session_id,
             ) = await self._context_stack.enter_async_context(
-                streamablehttp_client(self.config.url)
+                streamable_http_client(self.config.url)
             )
 
             # Create and initialize session

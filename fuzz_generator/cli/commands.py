@@ -667,10 +667,15 @@ def status(ctx: click.Context) -> None:
             async with MCPHttpClient(config) as client:
                 await client.list_tools()
                 return True
-        except Exception:
+        except BaseException:
+            # Catch all exceptions including RuntimeError from async generators
             return False
 
-    mcp_ok = _run_async(check_mcp())
+    try:
+        mcp_ok = _run_async(check_mcp())
+    except BaseException:
+        # Handle any uncaught exceptions from async context
+        mcp_ok = False
     if mcp_ok:
         click.echo(click.style("  ✓ Connected", fg="green"))
     else:

@@ -3,7 +3,6 @@
 import asyncio
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -270,16 +269,11 @@ class TestBatchExecutorPerformance:
             tasks=tasks,
         )
 
-        # Mock fast orchestrator
-        mock_orchestrator = AsyncMock()
-        mock_orchestrator.run = AsyncMock(
-            return_value=MagicMock(
-                success=True,
-                data=TaskResult(task_id="test", success=True),
-            )
-        )
+        # Mock fast task executor
+        async def mock_task_executor(task):
+            return TaskResult(task_id=task.task_id, success=True)
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_task_executor)
 
         start = time.perf_counter()
         result = await executor.execute(batch, max_concurrent=1)
@@ -309,18 +303,11 @@ class TestBatchExecutorPerformance:
             tasks=tasks,
         )
 
-        mock_orchestrator = AsyncMock()
-
-        async def slow_run(*args, **kwargs):
+        async def slow_task_executor(task):
             await asyncio.sleep(0.01)  # Small delay
-            return MagicMock(
-                success=True,
-                data=TaskResult(task_id="test", success=True),
-            )
+            return TaskResult(task_id=task.task_id, success=True)
 
-        mock_orchestrator.run = slow_run
-
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=slow_task_executor)
 
         # Concurrent should be faster
         start = time.perf_counter()

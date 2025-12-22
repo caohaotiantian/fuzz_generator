@@ -18,16 +18,10 @@ from fuzz_generator.agents.autogen_agents import (
 )
 from fuzz_generator.agents.base import AgentConfig, AgentResult, BaseAgent, PromptTemplate
 
-# Legacy agents (for backwards compatibility, may be deprecated)
-from fuzz_generator.agents.code_analyzer import CodeAnalyzerAgent
-from fuzz_generator.agents.context_builder import ContextBuilderAgent
-from fuzz_generator.agents.model_generator import ModelGeneratorAgent
-from fuzz_generator.agents.orchestrator import OrchestratorAgent
-
 __all__ = [
-    # Two-phase workflow (new design)
+    # Two-phase workflow
     "TwoPhaseWorkflow",
-    "AnalysisWorkflowRunner",  # Alias for backward compatibility
+    "AnalysisWorkflowRunner",
     "create_analysis_tools",
     "run_single_agent_analysis",
     "PromptLoader",
@@ -38,9 +32,4 @@ __all__ = [
     "AgentConfig",
     "AgentResult",
     "PromptTemplate",
-    # Legacy agents (deprecated)
-    "CodeAnalyzerAgent",
-    "ContextBuilderAgent",
-    "ModelGeneratorAgent",
-    "OrchestratorAgent",
 ]

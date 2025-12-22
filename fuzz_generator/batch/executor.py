@@ -4,11 +4,11 @@ Supports concurrent execution, progress reporting, and partial failure handling.
 """
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Protocol
 
-from fuzz_generator.agents.orchestrator import OrchestratorAgent
 from fuzz_generator.config import Settings
 from fuzz_generator.exceptions import TaskError
 from fuzz_generator.models import AnalysisTask, BatchTask, TaskResult
@@ -16,6 +16,14 @@ from fuzz_generator.storage import StorageBackend
 from fuzz_generator.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+class TaskExecutor(Protocol):
+    """Protocol for task executors."""
+
+    async def __call__(self, task: AnalysisTask) -> TaskResult:
+        """Execute a single task and return result."""
+        ...
 
 
 @dataclass
@@ -77,18 +85,19 @@ class BatchExecutor:
 
     def __init__(
         self,
-        orchestrator: OrchestratorAgent | None = None,
+        task_executor: TaskExecutor | Callable[[AnalysisTask], Awaitable[TaskResult]] | None = None,
         settings: Settings | None = None,
         storage: StorageBackend | None = None,
     ):
         """Initialize executor.
 
         Args:
-            orchestrator: OrchestratorAgent instance for task execution.
+            task_executor: Callable that executes a single task and returns TaskResult.
+                           Can be a TwoPhaseWorkflow.run method or any async function.
             settings: Application settings.
             storage: Storage backend for state management.
         """
-        self.orchestrator = orchestrator
+        self.task_executor = task_executor
         self.settings = settings
         self.storage = storage
         self._cancelled = False
@@ -317,40 +326,29 @@ class BatchExecutor:
         task.start()
 
         try:
-            if self.orchestrator is None:
-                raise TaskError("No orchestrator configured")
+            if self.task_executor is None:
+                raise TaskError("No task executor configured")
 
-            # Run the orchestrator
-            agent_result = await self.orchestrator.run(
-                project_path=batch.project_path,
-                source_file=task.source_file,
-                function_name=task.function_name,
-                output_name=task.output_name,
-                task_id=task.task_id,
-            )
+            # Run the task executor (e.g., TwoPhaseWorkflow.run)
+            result = await self.task_executor(task)
 
-            if agent_result.success:
+            if result.success:
                 task.complete()
-                # Extract TaskResult from agent result
-                if isinstance(agent_result.data, TaskResult):
-                    return agent_result.data
-                else:
-                    return TaskResult(
-                        task_id=task.task_id,
-                        success=True,
-                        xml_content=agent_result.data.get("xml_content")
-                        if isinstance(agent_result.data, dict)
-                        else None,
-                        duration_seconds=task.duration_seconds or 0.0,
-                    )
             else:
-                task.fail(agent_result.error or "Unknown error")
-                return TaskResult(
-                    task_id=task.task_id,
-                    success=False,
-                    errors=[agent_result.error or "Unknown error"],
-                    duration_seconds=task.duration_seconds or 0.0,
+                task.fail(result.errors[0] if result.errors else "Unknown error")
+
+            # Update duration from task if not set in result
+            if result.duration_seconds == 0.0 and task.duration_seconds:
+                result = TaskResult(
+                    task_id=result.task_id,
+                    success=result.success,
+                    xml_content=result.xml_content,
+                    errors=result.errors,
+                    warnings=result.warnings,
+                    duration_seconds=task.duration_seconds,
                 )
+
+            return result
 
         except Exception as e:
             logger.error(f"Task {task.task_id} failed: {e}")

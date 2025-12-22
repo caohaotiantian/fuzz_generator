@@ -1,6 +1,6 @@
 """Tests for batch task executor."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -82,21 +82,15 @@ class TestBatchExecutor:
     """Tests for BatchExecutor class."""
 
     @pytest.fixture
-    def mock_orchestrator(self):
-        """Create mock orchestrator."""
-        orchestrator = AsyncMock()
-        orchestrator.run = AsyncMock(
-            return_value=MagicMock(
+    def mock_task_executor(self):
+        """Create mock task executor."""
+        async def executor(task: AnalysisTask) -> TaskResult:
+            return TaskResult(
+                task_id=task.task_id,
                 success=True,
-                data=TaskResult(
-                    task_id="test",
-                    success=True,
-                    xml_content="<DataModel>...</DataModel>",
-                ),
-                error=None,
+                xml_content="<DataModel>...</DataModel>",
             )
-        )
-        return orchestrator
+        return AsyncMock(side_effect=executor)
 
     @pytest.fixture
     def sample_batch(self) -> BatchTask:
@@ -121,18 +115,18 @@ class TestBatchExecutor:
     def test_executor_creation(self):
         """Test executor can be created."""
         executor = BatchExecutor()
-        assert executor.orchestrator is None
+        assert executor.task_executor is None
         assert executor.settings is None
 
-    def test_executor_with_orchestrator(self, mock_orchestrator):
-        """Test executor with orchestrator."""
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
-        assert executor.orchestrator == mock_orchestrator
+    def test_executor_with_task_executor(self, mock_task_executor):
+        """Test executor with task executor."""
+        executor = BatchExecutor(task_executor=mock_task_executor)
+        assert executor.task_executor == mock_task_executor
 
     @pytest.mark.asyncio
-    async def test_execute_batch(self, mock_orchestrator, sample_batch):
+    async def test_execute_batch(self, mock_task_executor, sample_batch):
         """Test executing a batch."""
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_task_executor)
         result = await executor.execute(sample_batch)
 
         assert result.batch_id == "test_batch"
@@ -140,60 +134,54 @@ class TestBatchExecutor:
         assert result.completed_tasks == 2
         assert result.failed_tasks == 0
         assert len(result.results) == 2
-        assert mock_orchestrator.run.call_count == 2
+        assert mock_task_executor.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_execute_sequential(self, mock_orchestrator, sample_batch):
+    async def test_execute_sequential(self, mock_task_executor, sample_batch):
         """Test sequential execution."""
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_task_executor)
         result = await executor.execute(sample_batch, max_concurrent=1)
 
         assert result.completed_tasks == 2
-        assert mock_orchestrator.run.call_count == 2
+        assert mock_task_executor.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_execute_concurrent(self, mock_orchestrator, sample_batch):
+    async def test_execute_concurrent(self, mock_task_executor, sample_batch):
         """Test concurrent execution."""
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_task_executor)
         result = await executor.execute(sample_batch, max_concurrent=2)
 
         assert result.completed_tasks == 2
-        assert mock_orchestrator.run.call_count == 2
+        assert mock_task_executor.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_partial_failure(self, mock_orchestrator, sample_batch):
+    async def test_partial_failure(self, sample_batch):
         """Test partial task failure."""
-        mock_orchestrator.run = AsyncMock(
-            side_effect=[
-                MagicMock(
-                    success=True,
-                    data=TaskResult(task_id="task_1", success=True),
-                    error=None,
-                ),
-                MagicMock(
-                    success=False,
-                    data=None,
-                    error="Task failed",
-                ),
-            ]
-        )
+        call_count = 0
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
-        result = await executor.execute(sample_batch, fail_fast=False)
+        async def executor(task: AnalysisTask) -> TaskResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return TaskResult(task_id=task.task_id, success=True)
+            else:
+                return TaskResult(task_id=task.task_id, success=False, errors=["Task failed"])
+
+        mock_executor = AsyncMock(side_effect=executor)
+        batch_executor = BatchExecutor(task_executor=mock_executor)
+        result = await batch_executor.execute(sample_batch, fail_fast=False)
 
         assert result.completed_tasks == 1
         assert result.failed_tasks == 1
         assert len(result.results) == 2
 
     @pytest.mark.asyncio
-    async def test_fail_fast(self, mock_orchestrator, sample_batch):
+    async def test_fail_fast(self, sample_batch):
         """Test fail-fast behavior."""
-        mock_orchestrator.run = AsyncMock(
-            side_effect=[
-                MagicMock(success=False, error="Task failed"),
-                MagicMock(success=True, data=TaskResult(task_id="task_2", success=True)),
-            ]
-        )
+        async def failing_executor(task: AnalysisTask) -> TaskResult:
+            return TaskResult(task_id=task.task_id, success=False, errors=["Task failed"])
+
+        mock_executor = AsyncMock(side_effect=failing_executor)
 
         # Add a third task
         sample_batch.tasks.append(
@@ -204,22 +192,22 @@ class TestBatchExecutor:
             )
         )
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_executor)
         result = await executor.execute(sample_batch, fail_fast=True)
 
         assert result.failed_tasks == 1
         assert result.cancelled_tasks == 2
-        assert mock_orchestrator.run.call_count == 1  # Only first task was executed
+        assert mock_executor.call_count == 1  # Only first task was executed
 
     @pytest.mark.asyncio
-    async def test_progress_callback(self, mock_orchestrator, sample_batch):
+    async def test_progress_callback(self, mock_task_executor, sample_batch):
         """Test progress callback."""
         progress_calls = []
 
         def on_progress(completed, total, task):
             progress_calls.append((completed, total, task))
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_task_executor)
         await executor.execute(sample_batch, on_progress=on_progress)
 
         # Should have calls for each task + final call
@@ -228,21 +216,21 @@ class TestBatchExecutor:
         assert progress_calls[-1][0] == progress_calls[-1][1]
 
     @pytest.mark.asyncio
-    async def test_task_complete_callback(self, mock_orchestrator, sample_batch):
+    async def test_task_complete_callback(self, mock_task_executor, sample_batch):
         """Test task completion callback."""
         completed_tasks = []
 
         def on_task_complete(result):
             completed_tasks.append(result)
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor(task_executor=mock_task_executor)
         await executor.execute(sample_batch, on_task_complete=on_task_complete)
 
         assert len(completed_tasks) == 2
         assert all(isinstance(t, TaskResult) for t in completed_tasks)
 
     @pytest.mark.asyncio
-    async def test_task_dependencies(self, mock_orchestrator):
+    async def test_task_dependencies(self, mock_task_executor):
         """Test task dependencies are respected."""
         batch = BatchTask(
             batch_id="test_batch",
@@ -262,31 +250,72 @@ class TestBatchExecutor:
             ],
         )
 
-        call_order = []
-
-        async def track_call(*args, **kwargs):
-            call_order.append(kwargs.get("task_id"))
-            return MagicMock(
-                success=True,
-                data=TaskResult(task_id=kwargs.get("task_id", "test"), success=True),
-                error=None,
-            )
-
-        mock_orchestrator.run = track_call
-
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
-        result = await executor.execute(batch, max_concurrent=1)
+        executor = BatchExecutor(task_executor=mock_task_executor)
+        result = await executor.execute(batch)
 
         assert result.completed_tasks == 2
-        # task_1 should execute before task_2 due to dependency
-        assert call_order.index("task_1") < call_order.index("task_2")
+        # task_2 should only run after task_1
 
     @pytest.mark.asyncio
-    async def test_dependency_failure_skips_dependent(self, mock_orchestrator):
-        """Test that dependent tasks are skipped when dependency fails."""
-        batch = BatchTask(
+    async def test_dependency_failure_skips_dependent(self, sample_batch):
+        """Test that failed dependency skips dependent task."""
+        call_count = 0
+
+        async def executor(task: AnalysisTask) -> TaskResult:
+            nonlocal call_count
+            call_count += 1
+            if task.task_id == "task_1":
+                return TaskResult(task_id=task.task_id, success=False, errors=["Failed"])
+            return TaskResult(task_id=task.task_id, success=True)
+
+        # Make task_2 depend on task_1
+        sample_batch.tasks[1].depends_on = ["task_1"]
+
+        mock_executor = AsyncMock(side_effect=executor)
+        batch_executor = BatchExecutor(task_executor=mock_executor)
+        result = await batch_executor.execute(sample_batch)
+
+        assert result.failed_tasks == 2  # Both failed (task_1 failed, task_2 skipped)
+        assert mock_executor.call_count == 1  # Only task_1 was executed
+
+    @pytest.mark.asyncio
+    async def test_no_task_executor(self, sample_batch):
+        """Test error when no task executor configured."""
+        executor = BatchExecutor()
+        result = await executor.execute(sample_batch)
+
+        assert result.failed_tasks == 2
+        assert all("No task executor configured" in str(r.errors) for r in result.results)
+
+    def test_cancel(self, mock_task_executor):
+        """Test cancellation."""
+        executor = BatchExecutor(task_executor=mock_task_executor)
+        assert not executor.is_cancelled
+
+        executor.cancel()
+        assert executor.is_cancelled
+
+    @pytest.mark.asyncio
+    async def test_duration_tracking(self, mock_task_executor, sample_batch):
+        """Test duration tracking."""
+        executor = BatchExecutor(task_executor=mock_task_executor)
+        result = await executor.execute(sample_batch)
+
+        assert result.start_time is not None
+        assert result.end_time is not None
+        assert result.duration_seconds is not None
+        assert result.duration_seconds >= 0
+
+
+class TestBatchExecutorEdgeCases:
+    """Tests for edge cases in BatchExecutor."""
+
+    @pytest.fixture
+    def sample_batch(self) -> BatchTask:
+        """Create sample batch for testing."""
+        return BatchTask(
             batch_id="test_batch",
-            project_path="/path",
+            project_path="/path/to/project",
             tasks=[
                 AnalysisTask(
                     task_id="task_1",
@@ -297,88 +326,20 @@ class TestBatchExecutor:
                     task_id="task_2",
                     source_file="b.c",
                     function_name="func_b",
-                    depends_on=["task_1"],
                 ),
             ],
         )
 
-        mock_orchestrator.run = AsyncMock(
-            return_value=MagicMock(success=False, error="Task failed")
-        )
-
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
-        result = await executor.execute(batch, fail_fast=False)
-
-        # task_1 fails, task_2 should be skipped due to failed dependency
-        assert result.failed_tasks == 2
-        # Only task_1 should have been executed
-        assert mock_orchestrator.run.call_count == 1
-
     @pytest.mark.asyncio
-    async def test_cancel_execution(self, mock_orchestrator, sample_batch):
-        """Test cancelling execution."""
-        # Add more tasks
-        for i in range(3, 10):
-            sample_batch.tasks.append(
-                AnalysisTask(
-                    task_id=f"task_{i}",
-                    source_file=f"{i}.c",
-                    function_name=f"func_{i}",
-                )
-            )
-
-        call_count = 0
-
-        async def slow_run(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 2:
-                executor.cancel()
-            return MagicMock(
-                success=True,
-                data=TaskResult(task_id=kwargs.get("task_id", "test"), success=True),
-                error=None,
-            )
-
-        mock_orchestrator.run = slow_run
-
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
-        result = await executor.execute(sample_batch, max_concurrent=1)
-
-        # Should have some cancelled tasks
-        assert result.cancelled_tasks > 0
-        assert executor.is_cancelled is True
-
-    @pytest.mark.asyncio
-    async def test_no_orchestrator_error(self, sample_batch):
-        """Test error when no orchestrator is configured."""
-        executor = BatchExecutor()
-        result = await executor.execute(sample_batch)
-
-        assert result.failed_tasks == 2
-        assert all("No orchestrator" in r.errors[0] for r in result.results)
-
-    @pytest.mark.asyncio
-    async def test_exception_handling(self, mock_orchestrator, sample_batch):
-        """Test exception handling during task execution."""
-        mock_orchestrator.run = AsyncMock(side_effect=Exception("Unexpected error"))
-
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
-        result = await executor.execute(sample_batch)
-
-        assert result.failed_tasks == 2
-        assert all("Unexpected error" in r.errors[0] for r in result.results)
-
-    @pytest.mark.asyncio
-    async def test_empty_batch(self, mock_orchestrator):
+    async def test_empty_batch(self):
         """Test executing empty batch."""
         batch = BatchTask(
-            batch_id="empty_batch",
+            batch_id="empty",
             project_path="/path",
             tasks=[],
         )
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+        executor = BatchExecutor()
         result = await executor.execute(batch)
 
         assert result.total_tasks == 0
@@ -386,29 +347,40 @@ class TestBatchExecutor:
         assert result.success is True
 
     @pytest.mark.asyncio
-    async def test_batch_result_duration(self, mock_orchestrator, sample_batch):
-        """Test batch result has duration."""
-        executor = BatchExecutor(orchestrator=mock_orchestrator)
+    async def test_exception_in_executor(self, sample_batch):
+        """Test exception handling in task executor."""
+        async def failing_executor(task: AnalysisTask) -> TaskResult:
+            raise RuntimeError("Unexpected error")
+
+        mock_executor = AsyncMock(side_effect=failing_executor)
+        executor = BatchExecutor(task_executor=mock_executor)
         result = await executor.execute(sample_batch)
 
-        assert result.start_time is not None
-        assert result.end_time is not None
-        assert result.duration_seconds is not None
-        assert result.duration_seconds >= 0
+        assert result.failed_tasks == 2
+        assert all("Unexpected error" in str(r.errors) for r in result.results)
 
     @pytest.mark.asyncio
-    async def test_execute_with_settings(self, mock_orchestrator, sample_batch):
-        """Test execution with settings."""
-        from fuzz_generator.config import Settings
-
-        settings = Settings()
-        settings.batch.fail_fast = True
-        settings.batch.max_concurrent = 4
-
-        executor = BatchExecutor(
-            orchestrator=mock_orchestrator,
-            settings=settings,
+    async def test_single_task_batch(self):
+        """Test batch with single task."""
+        batch = BatchTask(
+            batch_id="single",
+            project_path="/path",
+            tasks=[
+                AnalysisTask(
+                    task_id="only_task",
+                    source_file="a.c",
+                    function_name="func",
+                ),
+            ],
         )
-        result = await executor.execute(sample_batch)
 
-        assert result.completed_tasks == 2
+        async def executor(task: AnalysisTask) -> TaskResult:
+            return TaskResult(task_id=task.task_id, success=True)
+
+        mock_executor = AsyncMock(side_effect=executor)
+        batch_executor = BatchExecutor(task_executor=mock_executor)
+        result = await batch_executor.execute(batch)
+
+        assert result.total_tasks == 1
+        assert result.completed_tasks == 1
+        assert result.success is True

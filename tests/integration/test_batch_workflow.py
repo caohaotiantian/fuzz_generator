@@ -1,13 +1,12 @@
 """Integration tests for batch workflow."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fuzz_generator.batch import BatchExecutor, BatchStateManager, TaskParser
 from fuzz_generator.config import Settings
-from fuzz_generator.models import TaskResult
+from fuzz_generator.models import AnalysisTask, TaskResult
 from fuzz_generator.storage import JsonStorage
 
 
@@ -52,22 +51,17 @@ tasks:
         assert len(batch.tasks) == 2
         assert batch.project_path == str(sample_c_project)
 
-        # Mock orchestrator
-        mock_orchestrator = AsyncMock()
-        mock_orchestrator.run = AsyncMock(
-            return_value=MagicMock(
+        # Mock task executor
+        async def mock_task_executor(task: AnalysisTask) -> TaskResult:
+            return TaskResult(
+                task_id=task.task_id,
                 success=True,
-                data=TaskResult(
-                    task_id="test",
-                    success=True,
-                    xml_content="<DataModel name='Test'/>",
-                ),
+                xml_content="<DataModel name='Test'/>",
             )
-        )
 
         # Execute batch
         executor = BatchExecutor(
-            orchestrator=mock_orchestrator,
+            task_executor=mock_task_executor,
             settings=settings,
             storage=storage,
         )
@@ -159,27 +153,25 @@ tasks:
         parser = TaskParser()
         batch = parser.parse(str(task_file))
 
-        # Mock orchestrator with failure on second task
+        # Mock task executor with failure on second task
         call_count = 0
 
-        async def mock_run(*args, **kwargs):
+        async def mock_task_executor(task: AnalysisTask) -> TaskResult:
             nonlocal call_count
             call_count += 1
             if call_count == 2:
-                return MagicMock(success=False, error="Simulated failure")
-            return MagicMock(
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=False,
+                    errors=["Simulated failure"],
+                )
+            return TaskResult(
+                task_id=task.task_id,
                 success=True,
-                data=TaskResult(
-                    task_id=kwargs.get("task_id", "test"),
-                    success=True,
-                    xml_content="<DataModel/>",
-                ),
+                xml_content="<DataModel/>",
             )
 
-        mock_orchestrator = AsyncMock()
-        mock_orchestrator.run = mock_run
-
-        executor = BatchExecutor(orchestrator=mock_orchestrator, settings=settings)
+        executor = BatchExecutor(task_executor=mock_task_executor, settings=settings)
         result = await executor.execute(batch, fail_fast=False)
 
         # Should complete 2, fail 1
@@ -218,15 +210,10 @@ tasks:
                 }
             )
 
-        mock_orchestrator = AsyncMock()
-        mock_orchestrator.run = AsyncMock(
-            return_value=MagicMock(
-                success=True,
-                data=TaskResult(task_id="test", success=True),
-            )
-        )
+        async def mock_task_executor(task: AnalysisTask) -> TaskResult:
+            return TaskResult(task_id=task.task_id, success=True)
 
-        executor = BatchExecutor(orchestrator=mock_orchestrator, settings=settings)
+        executor = BatchExecutor(task_executor=mock_task_executor, settings=settings)
         await executor.execute(batch, on_progress=on_progress)
 
         # Should have progress updates
