@@ -339,8 +339,15 @@ def create_analysis_tools(
 
         result = await _get_cfg(mcp_client, project_name, function_name)
         if result.success:
-            cfg = asdict(result.cfg)
-            return f"{function_name} 的控制流图:\n{json.dumps(cfg, indent=2, ensure_ascii=False)}"
+            cfg_data = {
+                "nodes": [asdict(n) for n in result.nodes],
+                "edges": [asdict(e) for e in result.edges],
+                "has_loops": result.has_loops,
+                "has_conditions": result.has_conditions,
+            }
+            return (
+                f"{function_name} 的控制流图:\n{json.dumps(cfg_data, indent=2, ensure_ascii=False)}"
+            )
         return f"Error: {result.error}"
 
     # Apply cache wrapper if provided (Optimization 1)
