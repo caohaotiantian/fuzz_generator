@@ -92,7 +92,7 @@ class AnalysisRunner:
             async with MCPHttpClient(self.mcp_config) as client:
                 result = await parse_project(
                     client,
-                    project_path=str(project_path),
+                    source_path=str(project_path),
                     project_name=name,
                     language=language if language != "auto" else None,
                 )
@@ -122,6 +122,7 @@ class AnalysisRunner:
         output_path: Path | None = None,
         output_name: str | None = None,
         knowledge_file: Path | None = None,
+        project_name: str | None = None,
     ) -> TaskResult | None:
         """Analyze a single function.
 
@@ -136,11 +137,13 @@ class AnalysisRunner:
             output_path: Output file path
             output_name: Custom name for generated DataModel
             knowledge_file: Path to custom knowledge file
+            project_name: Project name in MCP server (if different from directory name)
 
         Returns:
             TaskResult if successful, None otherwise
         """
-        project_name = project_path.name
+        # Use provided project_name or fall back to directory name
+        effective_project_name = project_name or project_path.name
 
         # Load custom knowledge
         custom_knowledge = ""
@@ -149,7 +152,7 @@ class AnalysisRunner:
 
         # Create task
         task = AnalysisTask(
-            task_id=f"{project_name}_{function_name}",
+            task_id=f"{effective_project_name}_{function_name}",
             source_file=source_file,
             function_name=function_name,
             output_name=output_name or f"{function_name}Model",
@@ -158,24 +161,51 @@ class AnalysisRunner:
         if not self.quiet:
             click.echo(f"Analyzing function: {function_name}")
             click.echo(f"  File: {source_file}")
+            click.echo(f"  Project: {effective_project_name}")
 
         try:
             async with MCPHttpClient(self.mcp_config) as mcp_client:
-                # Ensure project is active
-                await switch_project(mcp_client, project_name)
+                # Try to switch to project, or list available projects on failure
+                switch_result = await switch_project(mcp_client, effective_project_name)
+                if not switch_result.success:
+                    # Try to find the project
+                    from fuzz_generator.tools.project_tools import list_projects
 
-                # Run analysis with AutoGen agents
+                    projects_result = await list_projects(mcp_client)
+                    if projects_result.success and projects_result.projects:
+                        available = [p.name for p in projects_result.projects]
+                        click.echo(
+                            click.style(
+                                f"Project '{effective_project_name}' not found. "
+                                f"Available: {available}",
+                                fg="yellow",
+                            )
+                        )
+                        # Try first available project as fallback
+                        if len(available) == 1:
+                            effective_project_name = available[0]
+                            click.echo(f"  Using project: {effective_project_name}")
+                            await switch_project(mcp_client, effective_project_name)
+                        else:
+                            click.echo("  Please specify project name with --project-name")
+                            return None
+                    else:
+                        click.echo(
+                            click.style("No projects found. Run 'parse' command first.", fg="red")
+                        )
+                        return None
+
+                # Run analysis with AutoGen agents (uses custom model client)
                 from fuzz_generator.agents.autogen_agents import AnalysisWorkflowRunner
 
-                runner = AnalysisWorkflowRunner(
+                async with AnalysisWorkflowRunner(
                     settings=self.settings,
                     mcp_client=mcp_client,
-                    project_name=project_name,
+                    project_name=effective_project_name,
                     custom_knowledge=custom_knowledge,
-                    storage_path=self.work_dir,  # Enable intermediate result storage
-                )
-
-                result = await runner.run_analysis(task, verbose=self.verbose)
+                    storage_path=self.work_dir,
+                ) as runner:
+                    result = await runner.run_analysis(task, verbose=self.verbose)
 
                 if result.success:
                     if not self.quiet:
@@ -268,14 +298,14 @@ class AnalysisRunner:
                 from fuzz_generator.agents.autogen_agents import AnalysisWorkflowRunner
 
                 async def run_task(task: AnalysisTask) -> TaskResult:
-                    runner = AnalysisWorkflowRunner(
+                    async with AnalysisWorkflowRunner(
                         settings=self.settings,
                         mcp_client=mcp_client,
                         project_name=project_name,
                         custom_knowledge=custom_knowledge,
                         storage_path=self.work_dir,
-                    )
-                    return await runner.run_analysis(task, verbose=self.verbose)
+                    ) as runner:
+                        return await runner.run_analysis(task, verbose=self.verbose)
 
                 # Run tasks
                 results = []

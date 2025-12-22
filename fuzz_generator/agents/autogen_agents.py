@@ -1,36 +1,30 @@
-"""AutoGen-based Agent implementation for multi-agent collaboration.
+"""AutoGen-based Agent implementation for two-phase analysis workflow.
 
-This module implements the Agent system using AutoGen's AgentChat API,
-following the design specification for GroupChat-based collaboration.
+This module implements a simplified two-agent system:
+- AnalysisAgent: Combined code analysis + context building with iterative tool calls
+- ModelGenerator: DataModel generation based on analysis results
 
-Design Reference: docs/TECHNICAL_DESIGN.md Section 4.2
+Design Reference: docs/AGENT_OPTIMIZATION.md
 
-Agent Roles:
-- Orchestrator: Task coordination, workflow control, batch task management
-- CodeAnalyzer: Function code parsing, parameter analysis
-- ContextBuilder: Data flow/control flow analysis
-- ModelGenerator: DataModel generation
-
-Reference: https://microsoft.github.io/autogen/stable/reference/index.html
+The workflow is sequential and deterministic:
+1. AnalysisAgent iteratively collects code context (multiple tool calls)
+2. ModelGenerator generates XML based on analysis results
 """
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
-from autogen_agentchat.teams import SelectorGroupChat
-from autogen_agentchat.ui import Console
-from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_agentchat.teams import RoundRobinGroupChat
 
 from fuzz_generator.agents.base import PromptTemplate
+from fuzz_generator.agents.custom_model_client import CustomModelClient
 from fuzz_generator.config import Settings
-from fuzz_generator.models import (
-    AnalysisTask,
-    TaskResult,
-)
+from fuzz_generator.models import AnalysisTask, TaskResult
 from fuzz_generator.tools.mcp_client import MCPHttpClient
 from fuzz_generator.utils.logger import get_logger
 
@@ -45,7 +39,6 @@ logger = get_logger(__name__)
 class PromptLoader:
     """Load agent prompts from YAML files.
 
-    Design Reference: docs/TECHNICAL_DESIGN.md Section 4.1.2
     Loads prompts from config/defaults/prompts/ directory.
     """
 
@@ -54,10 +47,8 @@ class PromptLoader:
 
         Args:
             prompts_dir: Directory containing prompt YAML files.
-                        If None, uses default prompts directory.
         """
         if prompts_dir is None:
-            # Default to package's prompts directory
             package_dir = Path(__file__).parent.parent
             prompts_dir = package_dir / "config" / "defaults" / "prompts"
 
@@ -65,18 +56,10 @@ class PromptLoader:
         self._cache: dict[str, PromptTemplate] = {}
 
     def load(self, agent_name: str) -> PromptTemplate:
-        """Load prompt template for an agent.
-
-        Args:
-            agent_name: Agent name (e.g., 'code_analyzer', 'orchestrator')
-
-        Returns:
-            PromptTemplate instance
-        """
+        """Load prompt template for an agent."""
         if agent_name in self._cache:
             return self._cache[agent_name]
 
-        # Try to find the YAML file
         yaml_file = self.prompts_dir / f"{agent_name}.yaml"
 
         if yaml_file.exists():
@@ -85,8 +68,7 @@ class PromptLoader:
             logger.debug(f"Loaded prompt template from: {yaml_file}")
             return template
         else:
-            logger.warning(f"Prompt file not found: {yaml_file}, using default")
-            # Return empty template, will use fallback prompts
+            logger.warning(f"Prompt file not found: {yaml_file}")
             return PromptTemplate()
 
     def get_system_prompt(
@@ -95,19 +77,8 @@ class PromptLoader:
         custom_knowledge: str = "",
         **kwargs: Any,
     ) -> str:
-        """Get rendered system prompt for an agent.
-
-        Args:
-            agent_name: Agent name
-            custom_knowledge: Custom knowledge to inject
-            **kwargs: Additional template variables
-
-        Returns:
-            Rendered system prompt string
-        """
+        """Get rendered system prompt for an agent."""
         template = self.load(agent_name)
-
-        # Render system prompt with custom knowledge
         return template.render_system_prompt(
             custom_knowledge=custom_knowledge,
             **kwargs,
@@ -115,174 +86,99 @@ class PromptLoader:
 
 
 # ============================================================================
-# Default Fallback Prompts (used when YAML files are not available)
+# Default Fallback Prompts
 # ============================================================================
 
-DEFAULT_CODE_ANALYZER_PROMPT = """你是一个专业的代码分析专家（CodeAnalyzer），负责分析C/C++函数的结构和参数。
-
-## 你的任务
-1. 使用 get_function_code 工具获取目标函数的源代码
-2. 分析函数的输入参数及其类型
-3. 识别函数的输出（返回值、输出参数）
-4. 分析参数的约束条件（如：长度限制、取值范围等）
+DEFAULT_ANALYSIS_AGENT_PROMPT = """你是代码分析专家。分析目标函数，收集完整的上下文信息用于生成 Fuzz 测试数据模型。
 
 ## 可用工具
-- get_function_code: 获取函数源代码
-- list_functions: 列出项目中的函数
-- search_code: 搜索代码片段
+
+- get_function_code(function_name): 获取函数源代码
+- list_functions(file_path): 列出文件中的所有函数
+- search_code(pattern): 搜索代码模式
+- track_dataflow(source_pattern): 追踪数据流
+- get_callees(function_name): 获取被调用的函数
+- get_callers(function_name): 获取调用者
+- get_control_flow_graph(function_name): 获取控制流图
+
+## 工作流程
+
+1. 首先调用 get_function_code 获取目标函数代码
+2. 从代码中识别参数列表
+3. 对关键参数调用 track_dataflow 追踪数据流
+4. 调用 get_callees 获取被调用函数
+5. 调用 get_control_flow_graph 获取控制流
+
+## 规则
+
+- **必须** 先调用工具获取代码，禁止猜测
+- 工具出错时记录错误继续，不要讨论
+- 分析完成后输出 JSON，以 ANALYSIS_COMPLETE 结束
 
 ## 输出格式
-请以结构化的JSON格式输出分析结果：
 
 ```json
 {
-  "function_name": "函数名",
-  "file_path": "文件路径",
-  "line_number": 行号,
-  "return_type": "返回类型",
-  "description": "函数功能描述",
-  "parameters": [
-    {
-      "name": "参数名",
-      "type": "参数类型",
-      "direction": "in/out/inout",
-      "description": "参数描述",
-      "constraints": ["约束条件"]
-    }
-  ]
+  "status": "success",
+  "function": {"name": "函数名", "return_type": "返回类型", "source_code": "代码"},
+  "parameters": [{"name": "参数名", "type": "类型", "data_flow": [], "passed_to": []}],
+  "callees": [{"name": "函数名", "handles_parameters": []}],
+  "control_flow": {"conditions": [], "loops": []},
+  "errors": []
 }
 ```
 
-完成分析后，请说 "CODE_ANALYSIS_COMPLETE" 并附上JSON结果。
+ANALYSIS_COMPLETE
 """
 
-DEFAULT_CONTEXT_BUILDER_PROMPT = """你是一个代码上下文构建专家（ContextBuilder），负责分析函数的数据流和控制流。
+DEFAULT_MODEL_GENERATOR_PROMPT = """你是 Fuzz 测试数据模型生成专家。根据代码分析结果生成 XML DataModel。
 
-## 你的任务
-1. 使用 track_dataflow 追踪函数参数的数据流
-2. 使用 get_callers/get_callees 分析调用关系
-3. 使用 get_control_flow_graph 获取控制流信息
-4. 综合分析得出完整的上下文信息
+## DataModel 元素
 
-## 可用工具
-- track_dataflow: 追踪数据流
-- get_callers: 获取调用者
-- get_callees: 获取被调用函数
-- get_control_flow_graph: 获取控制流图
+- <String>: 字符串 (name, value, maxLength)
+- <Number>: 数值 (name, size, signed, endian)
+- <Blob>: 二进制数据 (name, length)
+- <Block>: 结构块 (name, ref)
+- <Choice>: 选择结构
 
-## 输出格式
-请以结构化的JSON格式输出上下文信息：
+## 规则
 
-```json
-{
-  "data_flows": [
-    {
-      "parameter": "参数名",
-      "flows_to": ["使用位置"],
-      "transformations": ["数据变换"]
-    }
-  ],
-  "callers": ["调用者列表"],
-  "callees": ["被调用函数列表"],
-  "control_flow_complexity": "简单/中等/复杂",
-  "key_constraints": ["关键约束"]
-}
-```
-
-完成分析后，请说 "CONTEXT_BUILDING_COMPLETE" 并附上JSON结果。
-"""
-
-DEFAULT_MODEL_GENERATOR_PROMPT = """你是一个fuzz测试数据建模专家（ModelGenerator），负责生成Secray格式的XML DataModel。
-
-## 你的任务
-基于代码分析和上下文信息，为函数参数生成合适的DataModel定义。
-
-## Secray DataModel元素类型
-
-### 基本元素
-- **String**: 字符串数据
-  - name: 元素名称（必需）
-  - value: 默认值
-  - token: 是否为固定标记
-  - mutable: 是否可变
-
-- **Number**: 数值数据
-  - name: 元素名称（必需）
-  - size: 位数（8/16/32/64）
-  - signed: 是否有符号
-  - endian: 字节序（big/little）
-
-- **Blob**: 二进制数据
-  - name: 元素名称（必需）
-  - length: 长度（固定值或引用其他字段）
-  - minLength/maxLength: 长度范围
-
-### 结构元素
-- **Block**: 块结构
-  - name: 元素名称
-  - ref: 引用其他DataModel
-  - minOccurs/maxOccurs: 出现次数
-
-- **Choice**: 选择结构
-  - name: 元素名称
-  - 包含多个可选元素
+1. 每个参数对应一个元素
+2. char*/const char* → <String>
+3. int/long → <Number size="32">
+4. void* + length → <Blob length="length_field">
 
 ## 输出格式
-请输出有效的XML DataModel定义：
+
+直接输出 XML，以 MODEL_COMPLETE 结束：
 
 ```xml
-<DataModel name="模型名称">
-    <String name="字段1" value="默认值" />
-    <Number name="长度字段" size="32" signed="false" />
-    <Blob name="数据" length="长度字段" />
+<?xml version="1.0" encoding="UTF-8"?>
+<DataModel name="模型名">
+  <!-- 元素 -->
 </DataModel>
 ```
 
-完成生成后，请说 "MODEL_GENERATION_COMPLETE" 并附上XML结果。
-"""
+MODEL_COMPLETE
 
-DEFAULT_ORCHESTRATOR_PROMPT = """你是分析流程协调者（Orchestrator），负责协调代码分析、上下文构建和模型生成三个阶段。
-
-## 工作流程
-根据设计文档 docs/TECHNICAL_DESIGN.md Section 4.2.1 的协作流程：
-
-1. **Phase 1 - 代码解析**: 让 CodeAnalyzer 分析目标函数的结构和参数
-2. **Phase 2 - 上下文构建**: 让 ContextBuilder 构建数据流和控制流上下文
-3. **Phase 3 - 模型生成**: 让 ModelGenerator 生成DataModel定义
-
-## 你的职责
-- 确保各阶段按顺序执行
-- 汇总各阶段的分析结果
-- 处理错误情况并提供反馈
-- 决定下一个应该执行的Agent
-
-## 调度规则
-- 收到用户任务后，先调用 CodeAnalyzer
-- CodeAnalyzer 完成后（看到 CODE_ANALYSIS_COMPLETE），调用 ContextBuilder
-- ContextBuilder 完成后（看到 CONTEXT_BUILDING_COMPLETE），调用 ModelGenerator
-- ModelGenerator 完成后（看到 MODEL_GENERATION_COMPLETE），汇总结果
-
-## 任务完成标志
-当所有阶段完成且生成了有效的XML DataModel时，请说 "ANALYSIS_WORKFLOW_COMPLETE"。
-
-{custom_knowledge}
+只输出 XML，不要解释。
 """
 
 
 # ============================================================================
-# Tool Functions for MCP Integration
+# MCP Tool Functions
 # ============================================================================
 
 
-def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, Any]:
-    """Create tool functions that use the MCP client.
+def create_analysis_tools(mcp_client: MCPHttpClient, project_name: str) -> list:
+    """Create all analysis tool functions for AnalysisAgent.
 
     Args:
         mcp_client: MCP HTTP client instance
         project_name: Active project name in Joern
 
     Returns:
-        Dictionary of tool functions
+        List of tool functions
     """
 
     async def get_function_code(function_name: str) -> str:
@@ -296,9 +192,10 @@ def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, 
         """
         from fuzz_generator.tools.query_tools import get_function_code as _get_func
 
-        result = await _get_func(mcp_client, project_name, function_name)
+        # Note: query_tools.get_function_code signature is (client, function_name, project_name)
+        result = await _get_func(mcp_client, function_name, project_name)
         if result.success:
-            return result.code
+            return f"函数 {function_name} 的源代码:\n{result.code}"
         return f"Error: {result.error}"
 
     async def list_functions(file_path: str | None = None) -> str:
@@ -312,9 +209,12 @@ def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, 
         """
         from fuzz_generator.tools.query_tools import list_functions as _list_funcs
 
-        result = await _list_funcs(mcp_client, project_name, file_filter=file_path)
+        result = await _list_funcs(mcp_client, project_name, file_name=file_path)
         if result.success:
-            return json.dumps([f.model_dump() for f in result.functions], indent=2)
+            funcs = [
+                {"name": f.name, "file": f.file, "line": f.line_number} for f in result.functions
+            ]
+            return f"找到 {len(funcs)} 个函数:\n{json.dumps(funcs, indent=2, ensure_ascii=False)}"
         return f"Error: {result.error}"
 
     async def search_code(pattern: str) -> str:
@@ -330,24 +230,33 @@ def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, 
 
         result = await _search(mcp_client, project_name, pattern)
         if result.success:
-            return json.dumps(result.results, indent=2)
+            return f"搜索结果:\n{json.dumps(result.results, indent=2, ensure_ascii=False)}"
         return f"Error: {result.error}"
 
-    async def track_dataflow(source_pattern: str, sink_pattern: str | None = None) -> str:
-        """Track data flow from source to sink.
+    async def track_dataflow(source_method: str, sink_method: str) -> str:
+        """Track data flow from source method to sink method.
 
         Args:
-            source_pattern: Source variable or pattern
-            sink_pattern: Optional sink pattern
+            source_method: Source method name (e.g., function parameter, "gets", "scanf")
+            sink_method: Sink method name (e.g., "strcpy", "printf", "system")
 
         Returns:
             JSON string of dataflow paths
         """
+        from dataclasses import asdict
+
         from fuzz_generator.tools.analysis_tools import track_dataflow as _track
 
-        result = await _track(mcp_client, project_name, source_pattern, sink_pattern=sink_pattern)
+        # Note: joern_mcp requires both source_method and sink_method
+        result = await _track(
+            mcp_client,
+            project_name,
+            source_method=source_method,
+            sink_method=sink_method,
+        )
         if result.success:
-            return json.dumps([f.model_dump() for f in result.flows], indent=2)
+            flows = [asdict(f) for f in result.flows]
+            return f"数据流追踪结果 ({source_method} -> {sink_method}):\n{json.dumps(flows, indent=2, ensure_ascii=False)}"
         return f"Error: {result.error}"
 
     async def get_callers(function_name: str) -> str:
@@ -359,11 +268,16 @@ def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, 
         Returns:
             JSON string of caller information
         """
+        from dataclasses import asdict
+
         from fuzz_generator.tools.analysis_tools import get_callers as _get_callers
 
         result = await _get_callers(mcp_client, project_name, function_name)
         if result.success:
-            return json.dumps([c.model_dump() for c in result.callers], indent=2)
+            callers = [asdict(c) for c in result.callers]
+            return (
+                f"调用 {function_name} 的函数:\n{json.dumps(callers, indent=2, ensure_ascii=False)}"
+            )
         return f"Error: {result.error}"
 
     async def get_callees(function_name: str) -> str:
@@ -375,11 +289,16 @@ def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, 
         Returns:
             JSON string of callee information
         """
+        from dataclasses import asdict
+
         from fuzz_generator.tools.analysis_tools import get_callees as _get_callees
 
         result = await _get_callees(mcp_client, project_name, function_name)
         if result.success:
-            return json.dumps([c.model_dump() for c in result.callees], indent=2)
+            callees = [asdict(c) for c in result.callees]
+            return (
+                f"{function_name} 调用的函数:\n{json.dumps(callees, indent=2, ensure_ascii=False)}"
+            )
         return f"Error: {result.error}"
 
     async def get_control_flow_graph(function_name: str) -> str:
@@ -391,296 +310,126 @@ def create_mcp_tools(mcp_client: MCPHttpClient, project_name: str) -> dict[str, 
         Returns:
             JSON string of CFG information
         """
+        from dataclasses import asdict
+
         from fuzz_generator.tools.analysis_tools import (
             get_control_flow_graph as _get_cfg,
         )
 
         result = await _get_cfg(mcp_client, project_name, function_name)
         if result.success:
-            return json.dumps(result.cfg.model_dump(), indent=2)
+            cfg = asdict(result.cfg)
+            return f"{function_name} 的控制流图:\n{json.dumps(cfg, indent=2, ensure_ascii=False)}"
         return f"Error: {result.error}"
 
-    return {
-        "get_function_code": get_function_code,
-        "list_functions": list_functions,
-        "search_code": search_code,
-        "track_dataflow": track_dataflow,
-        "get_callers": get_callers,
-        "get_callees": get_callees,
-        "get_control_flow_graph": get_control_flow_graph,
-    }
+    return [
+        get_function_code,
+        list_functions,
+        search_code,
+        track_dataflow,
+        get_callers,
+        get_callees,
+        get_control_flow_graph,
+    ]
 
 
 # ============================================================================
-# AutoGen Agent Factory
-# ============================================================================
-
-
-class AutoGenAgentFactory:
-    """Factory for creating AutoGen-based agents.
-
-    Implements the Agent roles defined in docs/TECHNICAL_DESIGN.md Section 3.2.3:
-    - Orchestrator: Task coordination, workflow control
-    - CodeAnalyzer: Function code parsing, parameter analysis
-    - ContextBuilder: Data flow/control flow analysis
-    - ModelGenerator: DataModel generation
-
-    Prompts are loaded from YAML files as per docs/TECHNICAL_DESIGN.md Section 4.1.2.
-    Agent settings (max_iterations, etc.) are read from Settings.agents.
-    """
-
-    def __init__(
-        self,
-        settings: Settings,
-        mcp_client: MCPHttpClient,
-        project_name: str,
-        custom_knowledge: str = "",
-        prompts_dir: Path | None = None,
-    ):
-        """Initialize agent factory.
-
-        Args:
-            settings: Application settings (includes agents.* config)
-            mcp_client: MCP HTTP client
-            project_name: Active project name
-            custom_knowledge: Custom background knowledge
-            prompts_dir: Directory containing prompt YAML files
-        """
-        self.settings = settings
-        self.mcp_client = mcp_client
-        self.project_name = project_name
-        self.custom_knowledge = custom_knowledge
-
-        # Load prompts from YAML files
-        self.prompt_loader = PromptLoader(prompts_dir)
-
-        # Create LLM client based on settings
-        self.model_client = OpenAIChatCompletionClient(
-            model=settings.llm.model,
-            base_url=settings.llm.base_url,
-            api_key=settings.llm.api_key,
-            temperature=settings.llm.temperature,
-        )
-
-        # Create tool functions
-        self.tools = create_mcp_tools(mcp_client, project_name)
-
-    def _get_system_prompt(self, agent_name: str, fallback_prompt: str) -> str:
-        """Get system prompt from YAML file or use fallback.
-
-        Args:
-            agent_name: Agent name for YAML lookup
-            fallback_prompt: Default prompt if YAML not found
-
-        Returns:
-            System prompt string
-        """
-        template = self.prompt_loader.load(agent_name)
-
-        # Check if template has content
-        if template.system_prompt:
-            # Render with custom knowledge if applicable
-            prompt = template.render_system_prompt(
-                custom_knowledge=self.custom_knowledge,
-            )
-            return prompt
-
-        # Use fallback
-        logger.debug(f"Using fallback prompt for {agent_name}")
-        if "{custom_knowledge}" in fallback_prompt and self.custom_knowledge:
-            return fallback_prompt.format(
-                custom_knowledge=f"\n## 背景知识\n{self.custom_knowledge}"
-            )
-        return fallback_prompt.replace("{custom_knowledge}", "")
-
-    def create_orchestrator(self) -> AssistantAgent:
-        """Create Orchestrator agent.
-
-        Design Reference: docs/TECHNICAL_DESIGN.md Section 3.2.3
-        Role: Task coordination, workflow control, batch task management
-        Tools: None (coordinates other agents)
-
-        Settings from: settings.agents.orchestrator
-        """
-        # Get prompt from YAML or fallback
-        prompt = self._get_system_prompt("orchestrator", DEFAULT_ORCHESTRATOR_PROMPT)
-
-        # Get max_iterations from settings
-        max_iterations = self.settings.agents.orchestrator.max_iterations
-        logger.debug(f"Orchestrator max_iterations: {max_iterations}")
-
-        return AssistantAgent(
-            name="Orchestrator",
-            model_client=self.model_client,
-            system_message=prompt,
-            description="负责协调分析流程，决定下一步执行哪个Agent",
-        )
-
-    def create_code_analyzer(self) -> AssistantAgent:
-        """Create CodeAnalyzer agent.
-
-        Design Reference: docs/TECHNICAL_DESIGN.md Section 3.2.3
-        Role: Function code parsing, parameter analysis
-        Tools: get_function_code, list_functions, search_code
-
-        Settings from: settings.agents.code_analyzer
-        """
-        # Get prompt from YAML or fallback
-        prompt = self._get_system_prompt("code_analyzer", DEFAULT_CODE_ANALYZER_PROMPT)
-
-        # Get settings
-        agent_settings = self.settings.agents.code_analyzer
-        logger.debug(f"CodeAnalyzer max_iterations: {agent_settings.max_iterations}")
-
-        return AssistantAgent(
-            name="CodeAnalyzer",
-            model_client=self.model_client,
-            system_message=prompt,
-            tools=[
-                self.tools["get_function_code"],
-                self.tools["list_functions"],
-                self.tools["search_code"],
-            ],
-            description="负责分析函数代码结构和参数，使用MCP工具获取源代码",
-        )
-
-    def create_context_builder(self) -> AssistantAgent:
-        """Create ContextBuilder agent.
-
-        Design Reference: docs/TECHNICAL_DESIGN.md Section 3.2.3
-        Role: Data flow/control flow analysis
-        Tools: track_dataflow, get_callees, get_callers, get_control_flow_graph
-
-        Settings from: settings.agents.context_builder
-        """
-        # Get prompt from YAML or fallback
-        prompt = self._get_system_prompt("context_builder", DEFAULT_CONTEXT_BUILDER_PROMPT)
-
-        # Get settings
-        agent_settings = self.settings.agents.context_builder
-        logger.debug(f"ContextBuilder max_iterations: {agent_settings.max_iterations}")
-
-        return AssistantAgent(
-            name="ContextBuilder",
-            model_client=self.model_client,
-            system_message=prompt,
-            tools=[
-                self.tools["track_dataflow"],
-                self.tools["get_callers"],
-                self.tools["get_callees"],
-                self.tools["get_control_flow_graph"],
-            ],
-            description="负责构建数据流和控制流上下文，分析调用关系",
-        )
-
-    def create_model_generator(self) -> AssistantAgent:
-        """Create ModelGenerator agent.
-
-        Design Reference: docs/TECHNICAL_DESIGN.md Section 3.2.3
-        Role: DataModel generation
-        Tools: None (generates based on context)
-
-        Settings from: settings.agents.model_generator
-        """
-        # Get prompt from YAML or fallback
-        prompt = self._get_system_prompt("model_generator", DEFAULT_MODEL_GENERATOR_PROMPT)
-
-        # Get settings
-        agent_settings = self.settings.agents.model_generator
-        logger.debug(f"ModelGenerator max_iterations: {agent_settings.max_iterations}")
-
-        return AssistantAgent(
-            name="ModelGenerator",
-            model_client=self.model_client,
-            system_message=prompt,
-            description="负责生成Secray XML DataModel定义",
-        )
-
-    def get_max_rounds(self) -> int:
-        """Get max rounds from orchestrator settings.
-
-        Returns:
-            Maximum rounds for GroupChat
-        """
-        return self.settings.agents.orchestrator.max_iterations
-
-
-# ============================================================================
-# Conversation History Recorder
+# Conversation Recorder
 # ============================================================================
 
 
 class ConversationRecorder:
-    """Records agent conversations for debugging and traceability.
-
-    Design Reference: docs/TECHNICAL_DESIGN.md Section 4.7.4
-    Saves: agent_conversations.json
-    """
+    """Records agent conversations for debugging."""
 
     def __init__(self, storage_path: Path | None = None):
-        """Initialize recorder.
-
-        Args:
-            storage_path: Path to store conversation logs
-        """
         self.storage_path = storage_path
         self.messages: list[dict[str, Any]] = []
 
     def record(self, agent_name: str, content: str, role: str = "assistant") -> None:
-        """Record a message.
-
-        Args:
-            agent_name: Name of the agent
-            content: Message content
-            role: Message role
-        """
+        """Record a message."""
         self.messages.append(
             {
                 "timestamp": datetime.now().isoformat(),
                 "agent": agent_name,
                 "role": role,
-                "content": content,
+                "content": content[:2000]
+                if len(content) > 2000
+                else content,  # Truncate long content
             }
         )
 
     def get_messages(self) -> list[dict[str, Any]]:
-        """Get all recorded messages."""
         return self.messages
 
     async def save(self, task_id: str) -> None:
-        """Save conversation to file.
-
-        Args:
-            task_id: Task identifier
-        """
+        """Save conversation to file."""
         if self.storage_path is None:
             return
 
-        # Create intermediate directory
         intermediate_dir = self.storage_path / "results" / task_id / "intermediate"
         intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save conversations
         conversations_file = intermediate_dir / "agent_conversations.json"
         conversations_file.write_text(json.dumps(self.messages, indent=2, ensure_ascii=False))
         logger.debug(f"Saved conversation to {conversations_file}")
 
 
 # ============================================================================
-# Analysis Workflow Runner
+# Output Validators
 # ============================================================================
 
 
-class AnalysisWorkflowRunner:
-    """Runner for the multi-agent analysis workflow.
+class OutputValidator:
+    """Validates agent outputs."""
 
-    Implements the analysis flow defined in docs/TECHNICAL_DESIGN.md Section 5.1:
-    1. CLI receives analyze command
-    2. Orchestrator initializes and coordinates
-    3. CodeAnalyzer analyzes function code
-    4. ContextBuilder builds data flow context
-    5. ModelGenerator generates XML DataModel
-    6. Results are saved and returned
+    @staticmethod
+    def extract_json(text: str) -> dict[str, Any] | None:
+        """Extract JSON from text."""
+        # Try to find JSON block
+        json_patterns = [
+            r"```json\s*([\s\S]*?)\s*```",  # Markdown code block
+            r"```\s*([\s\S]*?)\s*```",  # Generic code block
+            r"(\{[\s\S]*\})",  # Raw JSON
+        ]
+
+        for pattern in json_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    continue
+
+        return None
+
+    @staticmethod
+    def extract_xml(text: str) -> str | None:
+        """Extract XML DataModel from text."""
+        # Look for DataModel block
+        xml_match = re.search(r"<DataModel[\s\S]*?</DataModel>", text)
+        if xml_match:
+            return xml_match.group()
+        return None
+
+    @staticmethod
+    def validate_analysis_result(data: dict) -> bool:
+        """Validate analysis result structure."""
+        required = ["status", "function", "parameters"]
+        return all(key in data for key in required)
+
+
+# ============================================================================
+# Two-Phase Workflow
+# ============================================================================
+
+
+class TwoPhaseWorkflow:
+    """Two-phase analysis workflow.
+
+    Phase 1: AnalysisAgent iteratively collects code context
+    Phase 2: ModelGenerator creates XML DataModel
+
+    Design Reference: docs/AGENT_OPTIMIZATION.md Section 4
     """
 
     def __init__(
@@ -691,7 +440,7 @@ class AnalysisWorkflowRunner:
         custom_knowledge: str = "",
         storage_path: Path | None = None,
     ):
-        """Initialize workflow runner.
+        """Initialize workflow.
 
         Args:
             settings: Application settings
@@ -706,20 +455,55 @@ class AnalysisWorkflowRunner:
         self.custom_knowledge = custom_knowledge
         self.storage_path = storage_path
 
-        # Create agent factory
-        self.factory = AutoGenAgentFactory(settings, mcp_client, project_name, custom_knowledge)
+        # Load prompts
+        self.prompt_loader = PromptLoader()
+
+        # Create LLM client
+        self.model_client = CustomModelClient(
+            base_url=settings.llm.base_url,
+            model=settings.llm.model,
+            api_key=settings.llm.api_key,
+            temperature=settings.llm.temperature,
+            max_tokens=settings.llm.max_tokens,
+            timeout=settings.llm.timeout,
+        )
+
+        # Create tools
+        self.tools = create_analysis_tools(mcp_client, project_name)
 
         # Conversation recorder
         self.recorder = ConversationRecorder(storage_path)
 
-    async def run_analysis(
-        self,
-        task: AnalysisTask,
-        verbose: bool = True,
-    ) -> TaskResult:
-        """Run the complete analysis workflow for a task.
+        # Validator
+        self.validator = OutputValidator()
 
-        Implements the workflow in docs/TECHNICAL_DESIGN.md Section 4.2.1
+    async def close(self) -> None:
+        """Close resources (model client)."""
+        if self.model_client:
+            await self.model_client.close()
+
+    async def __aenter__(self) -> "TwoPhaseWorkflow":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit - ensures cleanup."""
+        await self.close()
+
+    def _get_prompt(self, agent_name: str, fallback: str) -> str:
+        """Get prompt from YAML or fallback."""
+        template = self.prompt_loader.load(agent_name)
+        if template.system_prompt:
+            prompt = template.render_system_prompt(custom_knowledge=self.custom_knowledge)
+            return prompt
+
+        # Use fallback
+        if "{custom_knowledge}" in fallback and self.custom_knowledge:
+            return fallback.format(custom_knowledge=f"\n## 背景知识\n{self.custom_knowledge}")
+        return fallback.replace("{custom_knowledge}", "")
+
+    async def run(self, task: AnalysisTask, verbose: bool = True) -> TaskResult:
+        """Run the two-phase analysis workflow.
 
         Args:
             task: Analysis task to execute
@@ -728,85 +512,37 @@ class AnalysisWorkflowRunner:
         Returns:
             TaskResult with analysis results
         """
-        logger.info(f"Starting analysis for: {task.function_name} in {task.source_file}")
+        logger.info(f"Starting two-phase analysis for: {task.function_name}")
 
         try:
-            # Create agents as per design doc Section 3.2.3
-            orchestrator = self.factory.create_orchestrator()
-            code_analyzer = self.factory.create_code_analyzer()
-            context_builder = self.factory.create_context_builder()
-            model_generator = self.factory.create_model_generator()
+            # Phase 1: Analysis
+            logger.info("Phase 1: Running AnalysisAgent...")
+            analysis_result = await self._run_analysis_phase(task, verbose)
 
-            # Get max_rounds from settings (settings.agents.orchestrator.max_iterations)
-            max_rounds = self.factory.get_max_rounds()
+            if not analysis_result:
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=False,
+                    xml_content=None,
+                    errors=["Analysis phase failed to produce valid results"],
+                    warnings=[],
+                )
 
-            # Define termination conditions
-            termination = TextMentionTermination(
-                "ANALYSIS_WORKFLOW_COMPLETE"
-            ) | MaxMessageTermination(max_rounds)
+            # Save intermediate analysis result
+            await self._save_analysis_result(task, analysis_result)
 
-            # Create SelectorGroupChat for intelligent agent selection
-            # Design doc Section 4.2.2: speaker_selection_method="auto"
-            team = SelectorGroupChat(
-                participants=[orchestrator, code_analyzer, context_builder, model_generator],
-                model_client=self.factory.model_client,
-                termination_condition=termination,
-                selector_prompt="""你是一个智能调度器，负责选择下一个应该发言的Agent。
-
-选择规则：
-1. 任务开始时，选择 Orchestrator 进行协调
-2. 需要分析代码时，选择 CodeAnalyzer
-3. 需要构建上下文时，选择 ContextBuilder
-4. 需要生成DataModel时，选择 ModelGenerator
-5. 需要协调或汇总时，选择 Orchestrator
-
-根据当前对话内容，选择最合适的Agent继续任务。
-""",
-            )
-
-            # Build initial task message
-            task_message = f"""请分析以下函数并生成DataModel：
-
-项目: {self.project_name}
-源文件: {task.source_file}
-函数名: {task.function_name}
-输出名称: {task.output_name or task.function_name + "Model"}
-
-请按照设计文档的流程执行：
-1. CodeAnalyzer: 分析函数代码结构
-2. ContextBuilder: 构建数据流和控制流上下文
-3. ModelGenerator: 生成XML DataModel
-
-{f"背景知识: {self.custom_knowledge}" if self.custom_knowledge else ""}
-"""
-
-            # Run the team
-            if verbose:
-                result = await Console(team.run_stream(task=task_message))
-            else:
-                result = await team.run(task=task_message)
-
-            # Record conversation
-            if hasattr(result, "messages"):
-                for msg in result.messages:
-                    agent_name = getattr(msg, "source", "unknown")
-                    content = getattr(msg, "content", str(msg))
-                    self.recorder.record(agent_name, content)
+            # Phase 2: Model Generation
+            logger.info("Phase 2: Running ModelGenerator...")
+            xml_content = await self._run_generation_phase(task, analysis_result, verbose)
 
             # Save conversation
             await self.recorder.save(task.task_id)
-
-            # Save intermediate results
-            await self._save_intermediate_results(task, result)
-
-            # Extract XML from result
-            xml_content = self._extract_xml_from_result(result)
 
             if xml_content:
                 return TaskResult(
                     task_id=task.task_id,
                     success=True,
-                    xml_content=xml_content,
+                    xml_content=self._wrap_xml(xml_content),
                     errors=[],
                     warnings=[],
                 )
@@ -815,12 +551,13 @@ class AnalysisWorkflowRunner:
                     task_id=task.task_id,
                     success=False,
                     xml_content=None,
-                    errors=["Failed to extract XML from agent response"],
+                    errors=["Model generation failed to produce valid XML"],
                     warnings=[],
                 )
 
         except Exception as e:
-            logger.error(f"Analysis failed: {e}")
+            logger.exception(f"Workflow error: {e}")
+            await self.recorder.save(task.task_id)
             return TaskResult(
                 task_id=task.task_id,
                 success=False,
@@ -829,16 +566,178 @@ class AnalysisWorkflowRunner:
                 warnings=[],
             )
 
-    async def _save_intermediate_results(
+    async def _run_analysis_phase(self, task: AnalysisTask, verbose: bool) -> dict[str, Any] | None:
+        """Run the analysis phase with AnalysisAgent.
+
+        The agent can make multiple tool calls iteratively.
+        """
+        # Get prompt
+        system_prompt = self._get_prompt("analysis_agent", DEFAULT_ANALYSIS_AGENT_PROMPT)
+
+        # Create AnalysisAgent with all tools
+        analysis_agent = AssistantAgent(
+            name="AnalysisAgent",
+            model_client=self.model_client,
+            system_message=system_prompt,
+            tools=self.tools,
+            description="负责分析代码结构、数据流和控制流",
+        )
+
+        # Create a simple team for single agent with tool execution
+        # Using RoundRobinGroupChat with single agent allows tool calls
+        termination = TextMentionTermination("ANALYSIS_COMPLETE") | MaxMessageTermination(
+            self.settings.agents.code_analyzer.max_iterations
+        )
+
+        team = RoundRobinGroupChat(
+            participants=[analysis_agent],
+            termination_condition=termination,
+        )
+
+        # Build simple task message (multi-line messages may cause LLM issues)
+        task_message = (
+            f"分析函数 {task.function_name}（项目: {self.project_name}，文件: {task.source_file}）"
+        )
+
+        # Run analysis
+        try:
+            # Note: Console(run_stream) has output issues, using run() directly
+            # and printing messages manually for verbose mode
+            result = await team.run(task=task_message)
+
+            if verbose and hasattr(result, "messages"):
+                for msg in result.messages:
+                    source = getattr(msg, "source", "unknown")
+                    content = self._extract_content(msg)
+                    msg_type = type(msg).__name__
+                    logger.info(f"[{msg_type}] {source}: {content[:200]}...")
+
+            # Record conversation
+            if hasattr(result, "messages"):
+                for msg in result.messages:
+                    agent_name = getattr(msg, "source", "unknown")
+                    content = self._extract_content(msg)
+                    self.recorder.record(agent_name, content)
+
+            # Extract JSON from the final messages
+            return self._extract_analysis_result(result)
+
+        except Exception as e:
+            logger.error(f"Analysis phase error: {e}")
+            return None
+
+    async def _run_generation_phase(
         self,
         task: AnalysisTask,
-        result: Any,
-    ) -> None:
-        """Save intermediate analysis results.
+        analysis_result: dict[str, Any],
+        verbose: bool,
+    ) -> str | None:
+        """Run the model generation phase."""
+        # Get prompt
+        system_prompt = self._get_prompt("model_generator", DEFAULT_MODEL_GENERATOR_PROMPT)
 
-        Design Reference: docs/TECHNICAL_DESIGN.md Section 4.7.4
-        Saves: task_meta.json, code_analysis.json, context_info.json
-        """
+        # Create ModelGenerator (no tools needed)
+        model_generator = AssistantAgent(
+            name="ModelGenerator",
+            model_client=self.model_client,
+            system_message=system_prompt,
+            description="负责生成 XML DataModel",
+        )
+
+        # Single call, no iteration needed
+        termination = TextMentionTermination("MODEL_COMPLETE") | MaxMessageTermination(3)
+
+        team = RoundRobinGroupChat(
+            participants=[model_generator],
+            termination_condition=termination,
+        )
+
+        # Build generation prompt (keep JSON compact for better LLM handling)
+        analysis_json = json.dumps(analysis_result, ensure_ascii=False)
+        task_message = f"根据分析结果生成 DataModel（名称: {task.output_name or task.function_name + 'Model'}）: {analysis_json}"
+
+        try:
+            result = await team.run(task=task_message)
+
+            if verbose and hasattr(result, "messages"):
+                for msg in result.messages:
+                    source = getattr(msg, "source", "unknown")
+                    content = self._extract_content(msg)
+                    msg_type = type(msg).__name__
+                    logger.info(f"[Gen] [{msg_type}] {source}: {content[:200]}...")
+
+            # Record conversation
+            if hasattr(result, "messages"):
+                for msg in result.messages:
+                    agent_name = getattr(msg, "source", "unknown")
+                    content = self._extract_content(msg)
+                    self.recorder.record(agent_name, content)
+
+            # Extract XML from result
+            return self._extract_xml_result(result)
+
+        except Exception as e:
+            logger.error(f"Generation phase error: {e}")
+            return None
+
+    def _extract_content(self, msg: Any) -> str:
+        """Extract string content from message."""
+        content = getattr(msg, "content", None)
+        if content is None:
+            return str(msg)
+        if isinstance(content, list):
+            return "\n".join(str(item) for item in content)
+        if not isinstance(content, str):
+            return str(content)
+        return content
+
+    def _extract_analysis_result(self, result: Any) -> dict[str, Any] | None:
+        """Extract analysis JSON from agent result."""
+        if not hasattr(result, "messages"):
+            return None
+
+        # Search from the end for ANALYSIS_COMPLETE marker
+        for msg in reversed(result.messages):
+            content = self._extract_content(msg)
+            if "ANALYSIS_COMPLETE" in content or "status" in content:
+                json_data = self.validator.extract_json(content)
+                if json_data and self.validator.validate_analysis_result(json_data):
+                    return json_data
+
+        # Fallback: try to extract any JSON from any message
+        for msg in reversed(result.messages):
+            content = self._extract_content(msg)
+            json_data = self.validator.extract_json(content)
+            if json_data:
+                return json_data
+
+        return None
+
+    def _extract_xml_result(self, result: Any) -> str | None:
+        """Extract XML from agent result."""
+        if not hasattr(result, "messages"):
+            return None
+
+        for msg in reversed(result.messages):
+            content = self._extract_content(msg)
+            xml = self.validator.extract_xml(content)
+            if xml:
+                return xml
+
+        return None
+
+    def _wrap_xml(self, xml_content: str) -> str:
+        """Wrap XML content in Secray root element."""
+        if xml_content.startswith("<?xml"):
+            # Remove existing XML declaration
+            xml_content = re.sub(r"<\?xml[^?]*\?>\s*", "", xml_content)
+
+        return f'<?xml version="1.0" encoding="utf-8"?>\n<Secray>\n{xml_content}\n</Secray>'
+
+    async def _save_analysis_result(
+        self, task: AnalysisTask, analysis_result: dict[str, Any]
+    ) -> None:
+        """Save intermediate analysis result."""
         if self.storage_path is None:
             return
 
@@ -859,76 +758,28 @@ class AnalysisWorkflowRunner:
             json.dumps(task_meta, indent=2, ensure_ascii=False)
         )
 
-        # Extract and save phase results from messages
-        if hasattr(result, "messages"):
-            code_analysis = self._extract_phase_result(result.messages, "CODE_ANALYSIS_COMPLETE")
-            if code_analysis:
-                (intermediate_dir / "code_analysis.json").write_text(
-                    json.dumps(code_analysis, indent=2, ensure_ascii=False)
-                )
-
-            context_info = self._extract_phase_result(result.messages, "CONTEXT_BUILDING_COMPLETE")
-            if context_info:
-                (intermediate_dir / "context_info.json").write_text(
-                    json.dumps(context_info, indent=2, ensure_ascii=False)
-                )
-
-    def _extract_phase_result(
-        self,
-        messages: list[Any],
-        marker: str,
-    ) -> dict[str, Any] | None:
-        """Extract phase result from messages by marker.
-
-        Args:
-            messages: List of messages
-            marker: Completion marker to look for
-
-        Returns:
-            Extracted JSON data or None
-        """
-        for msg in messages:
-            content = getattr(msg, "content", str(msg))
-            if isinstance(content, str) and marker in content:
-                # Try to extract JSON
-                try:
-                    json_start = content.find("{")
-                    json_end = content.rfind("}") + 1
-                    if json_start != -1 and json_end > json_start:
-                        return json.loads(content[json_start:json_end])
-                except json.JSONDecodeError:
-                    pass
-        return None
-
-    def _extract_xml_from_result(self, result: Any) -> str | None:
-        """Extract XML content from agent conversation result.
-
-        Args:
-            result: Result from team.run()
-
-        Returns:
-            Extracted XML string or None
-        """
-        # Try to find XML in the messages
-        if hasattr(result, "messages"):
-            for msg in reversed(result.messages):
-                content = getattr(msg, "content", str(msg))
-                if isinstance(content, str):
-                    # Look for XML DataModel block
-                    xml_start = content.find("<DataModel")
-                    if xml_start != -1:
-                        # Find the closing tag
-                        xml_end = content.find("</DataModel>", xml_start)
-                        if xml_end != -1:
-                            xml_content = content[xml_start : xml_end + len("</DataModel>")]
-                            # Wrap in Secray root
-                            return f'<?xml version="1.0" encoding="utf-8"?>\n<Secray>\n{xml_content}\n</Secray>'
-
-        return None
+        # Save analysis result
+        (intermediate_dir / "analysis_result.json").write_text(
+            json.dumps(analysis_result, indent=2, ensure_ascii=False)
+        )
+        logger.debug(f"Saved analysis result to {intermediate_dir}")
 
 
 # ============================================================================
-# Simplified Single-Step Analysis (Fallback)
+# Legacy Compatibility Alias
+# ============================================================================
+
+
+class AnalysisWorkflowRunner(TwoPhaseWorkflow):
+    """Alias for backward compatibility with runner.py."""
+
+    async def run_analysis(self, task: AnalysisTask, verbose: bool = True) -> TaskResult:
+        """Run analysis (alias for run method)."""
+        return await self.run(task, verbose=verbose)
+
+
+# ============================================================================
+# Single Agent Analysis (Simplified)
 # ============================================================================
 
 
@@ -942,20 +793,9 @@ async def run_single_agent_analysis(
 ) -> TaskResult:
     """Run a simplified single-agent analysis.
 
-    This is a fallback when GroupChat is not needed.
-
-    Args:
-        settings: Application settings
-        mcp_client: MCP HTTP client
-        project_name: Active project name
-        task: Analysis task
-        custom_knowledge: Custom knowledge
-        storage_path: Storage path for results
-
-    Returns:
-        TaskResult with analysis results
+    Fallback when full workflow is not needed.
     """
-    runner = AnalysisWorkflowRunner(
+    async with TwoPhaseWorkflow(
         settings, mcp_client, project_name, custom_knowledge, storage_path
-    )
-    return await runner.run_analysis(task, verbose=False)
+    ) as workflow:
+        return await workflow.run(task, verbose=False)

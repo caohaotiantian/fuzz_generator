@@ -44,8 +44,16 @@ def _get_settings(ctx: click.Context):
 
 
 def _run_async(coro):
-    """Run an async coroutine."""
-    return asyncio.run(coro)
+    """Run an async coroutine with proper exception handling."""
+    try:
+        return asyncio.run(coro)
+    except BaseException as eg:
+        # Handle ExceptionGroup from anyio task groups (Python 3.11+)
+        if hasattr(eg, "exceptions"):
+            for exc in eg.exceptions:
+                if not isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                    raise exc from eg
+        raise
 
 
 @click.group(cls=AliasedGroup, context_settings=CONTEXT_SETTINGS)
@@ -174,6 +182,12 @@ def cli(
     type=str,
     help="Custom name for generated DataModel (single function mode)",
 )
+@click.option(
+    "--project-name",
+    "-pn",
+    type=str,
+    help="Project name in MCP server (if different from directory name, use the name from 'parse' command)",
+)
 @click.pass_context
 def analyze(
     ctx: click.Context,
@@ -185,6 +199,7 @@ def analyze(
     knowledge_file: Path | None,
     resume: bool,
     output_name: str | None,
+    project_name: str | None,
 ) -> None:
     """Analyze functions and generate DataModel definitions.
 
@@ -197,6 +212,9 @@ def analyze(
     Examples:
         # Single function analysis
         fuzz-generator analyze -p ./src -f handler.c -fn process_request -o output.xml
+
+        # With explicit project name (from parse command)
+        fuzz-generator analyze -p ./src -f handler.c -fn process_request -pn my_project
 
         # Batch analysis
         fuzz-generator analyze -p ./src -t tasks.yaml -o ./output/
@@ -243,6 +261,7 @@ def analyze(
                 output_path=output,
                 output_name=output_name,
                 knowledge_file=knowledge_file,
+                project_name=project_name,
             )
         )
 

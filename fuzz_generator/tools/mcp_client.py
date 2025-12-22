@@ -1,16 +1,13 @@
 """MCP HTTP Client for Joern MCP Server communication.
 
 This module provides an async HTTP client for communicating with the
-Joern MCP Server using the MCP protocol over HTTP.
+Joern MCP Server using the official MCP protocol via streamable HTTP transport.
 """
 
 import asyncio
 import json
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
-
-import httpx
 
 from fuzz_generator.exceptions import MCPConnectionError, MCPToolError
 from fuzz_generator.utils.logger import get_logger
@@ -63,31 +60,11 @@ class MCPToolResult:
     error: str | None = None
 
 
-@dataclass
-class MCPResponse:
-    """MCP JSON-RPC response wrapper.
-
-    Attributes:
-        id: Request ID
-        result: Response result (for successful calls)
-        error: Error information (for failed calls)
-    """
-
-    id: str
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
-
-    @property
-    def is_success(self) -> bool:
-        """Check if response is successful."""
-        return self.error is None and self.result is not None
-
-
 class MCPHttpClient:
-    """Async HTTP client for Joern MCP Server.
+    """Async HTTP client for Joern MCP Server using official MCP protocol.
 
-    This client implements the MCP protocol using JSON-RPC 2.0 over HTTP.
-    It supports async context manager protocol for proper resource management.
+    This client uses the official MCP SDK's streamable HTTP transport
+    for communicating with FastMCP-based servers.
 
     Usage:
         async with MCPHttpClient(config) as client:
@@ -102,23 +79,61 @@ class MCPHttpClient:
             config: Client configuration
         """
         self.config = config
-        self._client: httpx.AsyncClient | None = None
-        self._request_id_counter = 0
+        self._session = None
+        self._read = None
+        self._write = None
+        self._context_stack = None
 
     async def __aenter__(self) -> "MCPHttpClient":
         """Enter async context manager."""
-        default_headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        default_headers.update(self.config.headers)
+        try:
+            from contextlib import AsyncExitStack
 
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout),
-            headers=default_headers,
-        )
-        logger.debug(f"MCP client initialized with URL: {self.config.url}")
-        return self
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamablehttp_client
+        except ImportError as e:
+            raise MCPConnectionError(
+                "MCP SDK not available. Please install: pip install mcp",
+                details={"import_error": str(e)},
+            ) from e
+
+        logger.debug(f"Connecting to MCP server: {self.config.url}")
+
+        try:
+            # Create exit stack to manage nested context managers
+            self._context_stack = AsyncExitStack()
+            await self._context_stack.__aenter__()
+
+            # Connect using streamable HTTP transport
+            # New API returns 3 values: read, write, get_session_id
+            (
+                self._read,
+                self._write,
+                _get_session_id,
+            ) = await self._context_stack.enter_async_context(
+                streamablehttp_client(self.config.url)
+            )
+
+            # Create and initialize session
+            self._session = await self._context_stack.enter_async_context(
+                ClientSession(self._read, self._write)
+            )
+
+            # Initialize the MCP session
+            await self._session.initialize()
+
+            logger.info(f"Connected to MCP server: {self.config.url}")
+            return self
+
+        except Exception as e:
+            # Clean up on failure
+            if self._context_stack:
+                await self._context_stack.__aexit__(type(e), e, e.__traceback__)
+                self._context_stack = None
+            raise MCPConnectionError(
+                f"Failed to connect to MCP server: {e}",
+                details={"url": self.config.url},
+            ) from e
 
     async def __aexit__(
         self,
@@ -127,84 +142,37 @@ class MCPHttpClient:
         exc_tb: Any,
     ) -> None:
         """Exit async context manager."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-            logger.debug("MCP client closed")
+        if self._context_stack:
+            try:
+                await self._context_stack.__aexit__(exc_type, exc_val, exc_tb)
+            except BaseException as e:
+                # Suppress cleanup errors from anyio task groups
+                # These can happen when the connection is closed
+                logger.debug(f"Suppressed cleanup error: {type(e).__name__}: {e}")
+            finally:
+                self._context_stack = None
+                self._session = None
+                self._read = None
+                self._write = None
+                logger.debug("MCP client disconnected")
 
-    def _generate_request_id(self) -> str:
-        """Generate unique request ID."""
-        self._request_id_counter += 1
-        return f"req-{uuid.uuid4().hex[:8]}-{self._request_id_counter}"
-
-    def _build_jsonrpc_request(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Build JSON-RPC 2.0 request.
-
-        Args:
-            method: RPC method name
-            params: Method parameters
-
-        Returns:
-            JSON-RPC request dict
-        """
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._generate_request_id(),
-            "method": method,
-        }
-        if params:
-            request["params"] = params
-        return request
-
-    def _parse_response(self, response_data: dict[str, Any]) -> MCPResponse:
-        """Parse JSON-RPC response.
-
-        Args:
-            response_data: Raw response data
-
-        Returns:
-            Parsed MCPResponse
-        """
-        return MCPResponse(
-            id=response_data.get("id", ""),
-            result=response_data.get("result"),
-            error=response_data.get("error"),
-        )
-
-    def _extract_tool_result(self, mcp_response: MCPResponse) -> MCPToolResult:
+    def _extract_tool_result(self, result: Any) -> MCPToolResult:
         """Extract tool result from MCP response.
 
         Args:
-            mcp_response: Parsed MCP response
+            result: MCP call result
 
         Returns:
             MCPToolResult with parsed data
         """
-        if mcp_response.error:
-            error_msg = mcp_response.error.get("message", "Unknown error")
-            error_code = mcp_response.error.get("code", -1)
-            return MCPToolResult(
-                success=False,
-                error=f"MCP Error [{error_code}]: {error_msg}",
-            )
-
-        if not mcp_response.result:
-            return MCPToolResult(success=False, error="Empty response")
-
-        # Extract content from MCP response
-        content_list = mcp_response.result.get("content", [])
-        if not content_list:
+        if not hasattr(result, "content") or not result.content:
             return MCPToolResult(success=True, data={}, raw_content="")
 
         # Find text content
         raw_content = ""
-        for content in content_list:
-            if content.get("type") == "text":
-                raw_content = content.get("text", "")
+        for content in result.content:
+            if hasattr(content, "text"):
+                raw_content = content.text
                 break
 
         # Try to parse as JSON
@@ -223,78 +191,6 @@ class MCPHttpClient:
                 raw_content=raw_content,
             )
 
-    async def _send_request(
-        self,
-        request_body: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Send HTTP request with retry logic.
-
-        Args:
-            request_body: JSON-RPC request body
-
-        Returns:
-            Response data
-
-        Raises:
-            MCPConnectionError: If connection fails after all retries
-        """
-        if not self._client:
-            raise MCPConnectionError("Client not initialized. Use 'async with' context manager.")
-
-        last_error: Exception | None = None
-
-        for attempt in range(self.config.retry_count + 1):
-            try:
-                logger.debug(
-                    f"Sending MCP request (attempt {attempt + 1}): {request_body.get('method')}"
-                )
-
-                response = await self._client.post(
-                    self.config.url,
-                    json=request_body,
-                )
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.ConnectError as e:
-                last_error = e
-                logger.warning(
-                    f"Connection error (attempt {attempt + 1}/{self.config.retry_count + 1}): {e}"
-                )
-            except httpx.TimeoutException as e:
-                last_error = e
-                logger.warning(
-                    f"Timeout error (attempt {attempt + 1}/{self.config.retry_count + 1}): {e}"
-                )
-            except httpx.HTTPStatusError as e:
-                last_error = e
-                logger.warning(
-                    f"HTTP error (attempt {attempt + 1}/{self.config.retry_count + 1}): "
-                    f"{e.response.status_code}"
-                )
-            except Exception as e:
-                last_error = e
-                logger.error(f"Unexpected error: {e}")
-                raise MCPConnectionError(
-                    f"Unexpected error during MCP request: {e}",
-                    details={"error_type": type(e).__name__},
-                ) from e
-
-            # Wait before retry (exponential backoff)
-            if attempt < self.config.retry_count:
-                delay = self.config.retry_delay * (2**attempt)
-                logger.debug(f"Retrying in {delay} seconds...")
-                await asyncio.sleep(delay)
-
-        # All retries exhausted
-        raise MCPConnectionError(
-            f"Failed to connect to MCP server after {self.config.retry_count + 1} attempts",
-            details={
-                "url": self.config.url,
-                "last_error": str(last_error),
-            },
-        )
-
     async def call_tool(
         self,
         tool_name: str,
@@ -310,40 +206,51 @@ class MCPHttpClient:
             MCPToolResult with the response data
 
         Raises:
-            MCPConnectionError: If connection fails
+            MCPConnectionError: If not connected
             MCPToolError: If tool call fails
         """
+        if not self._session:
+            raise MCPConnectionError("Client not initialized. Use 'async with' context manager.")
+
         logger.info(f"Calling MCP tool: {tool_name}")
         logger.debug(f"Tool arguments: {arguments}")
 
-        request = self._build_jsonrpc_request(
-            method="tools/call",
-            params={
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
+        last_error: Exception | None = None
+
+        for attempt in range(self.config.retry_count + 1):
+            try:
+                result = await asyncio.wait_for(
+                    self._session.call_tool(tool_name, arguments or {}),
+                    timeout=self.config.timeout,
+                )
+                tool_result = self._extract_tool_result(result)
+
+                if tool_result.success:
+                    logger.info(f"Tool call successful: {tool_name}")
+                    logger.debug(f"Tool result: {tool_result.data}")
+
+                return tool_result
+
+            except asyncio.TimeoutError as e:
+                last_error = e
+                logger.warning(f"Timeout (attempt {attempt + 1}/{self.config.retry_count + 1})")
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Tool call error (attempt {attempt + 1}/{self.config.retry_count + 1}): {e}"
+                )
+
+            # Wait before retry
+            if attempt < self.config.retry_count:
+                delay = self.config.retry_delay * (2**attempt)
+                logger.debug(f"Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        raise MCPToolError(
+            f"Failed to call tool '{tool_name}' after {self.config.retry_count + 1} attempts",
+            details={"tool_name": tool_name, "last_error": str(last_error)},
         )
-
-        try:
-            response_data = await self._send_request(request)
-            mcp_response = self._parse_response(response_data)
-            result = self._extract_tool_result(mcp_response)
-
-            if result.success:
-                logger.info(f"Tool call successful: {tool_name}")
-                logger.debug(f"Tool result: {result.data}")
-            else:
-                logger.warning(f"Tool call failed: {tool_name} - {result.error}")
-
-            return result
-
-        except MCPConnectionError:
-            raise
-        except Exception as e:
-            raise MCPToolError(
-                f"Failed to call tool '{tool_name}': {e}",
-                details={"tool_name": tool_name, "arguments": arguments},
-            ) from e
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """List available MCP tools.
@@ -352,29 +259,39 @@ class MCPHttpClient:
             List of tool definitions
 
         Raises:
-            MCPConnectionError: If connection fails
+            MCPConnectionError: If not connected
         """
+        if not self._session:
+            raise MCPConnectionError("Client not initialized. Use 'async with' context manager.")
+
         logger.info("Listing available MCP tools")
 
-        request = self._build_jsonrpc_request(method="tools/list")
-
         try:
-            response_data = await self._send_request(request)
-            mcp_response = self._parse_response(response_data)
+            result = await asyncio.wait_for(
+                self._session.list_tools(),
+                timeout=self.config.timeout,
+            )
 
-            if mcp_response.error:
-                logger.error(f"Failed to list tools: {mcp_response.error}")
-                return []
+            tools = []
+            if hasattr(result, "tools"):
+                for tool in result.tools:
+                    tools.append(
+                        {
+                            "name": tool.name,
+                            "description": getattr(tool, "description", ""),
+                            "inputSchema": getattr(tool, "inputSchema", {}),
+                        }
+                    )
 
-            tools = mcp_response.result.get("tools", []) if mcp_response.result else []
             logger.info(f"Found {len(tools)} available tools")
             return tools
 
-        except MCPConnectionError:
-            raise
         except Exception as e:
             logger.error(f"Failed to list tools: {e}")
-            return []
+            raise MCPConnectionError(
+                f"Failed to list tools: {e}",
+                details={"url": self.config.url},
+            ) from e
 
     async def ping(self) -> bool:
         """Check if MCP server is reachable.

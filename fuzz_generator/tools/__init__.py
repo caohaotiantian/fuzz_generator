@@ -24,7 +24,6 @@ from fuzz_generator.tools.analysis_tools import (
 from fuzz_generator.tools.mcp_client import (
     MCPClientConfig,
     MCPHttpClient,
-    MCPResponse,
     MCPToolResult,
 )
 from fuzz_generator.tools.project_tools import (
@@ -52,7 +51,6 @@ __all__ = [
     # MCP Client
     "MCPClientConfig",
     "MCPHttpClient",
-    "MCPResponse",
     "MCPToolResult",
     # Project Tools
     "ParseProjectResult",

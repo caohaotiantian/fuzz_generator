@@ -7,6 +7,7 @@ This module provides wrapper functions for code query MCP tools:
 - execute_query: Execute custom Joern query
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -171,6 +172,44 @@ async def get_function_code(
             )
 
         data = result.data
+
+        # Handle the joern_mcp response format:
+        # {"success": true, "project": "...", "functions": [{"code": "..."}], "count": 1}
+        functions = data.get("functions", [])
+        if functions:
+            func_data = functions[0]
+            code_str = func_data.get("code", "")
+
+            # Handle double-encoded JSON string
+            if code_str.startswith('""') and code_str.endswith('""'):
+                code_str = code_str[2:-2]  # Remove outer quotes
+
+            # Try to parse as JSON if it looks like an array
+            if code_str.startswith("["):
+                try:
+                    parsed = json.loads(code_str)
+                    if parsed and isinstance(parsed, list) and len(parsed) > 0:
+                        func_info = parsed[0]
+                        return FunctionCodeResult(
+                            success=True,
+                            function_name=func_info.get("name", function_name),
+                            code=func_info.get("code", ""),
+                            file=func_info.get("filename", ""),
+                            line_number=func_info.get("lineNumber", 0),
+                            end_line=func_info.get("lineNumberEnd", 0),
+                            signature=func_info.get("signature", ""),
+                        )
+                except json.JSONDecodeError:
+                    pass
+
+            # Fallback: use as-is
+            return FunctionCodeResult(
+                success=True,
+                function_name=function_name,
+                code=code_str,
+            )
+
+        # Original format fallback
         return FunctionCodeResult(
             success=data.get("success", True),
             function_name=data.get("function_name", function_name),
