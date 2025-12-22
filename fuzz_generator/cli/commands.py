@@ -109,8 +109,6 @@ def cli(
 
         # Parse project first
         fuzz-generator parse -p ./src
-
-    For more information, see: https://github.com/your-org/fuzz_generator
     """
     # Ensure context object exists
     ctx.ensure_object(dict)
@@ -298,7 +296,7 @@ def analyze(
 )
 @click.option(
     "--project-name",
-    "-n",
+    "-pn",
     type=str,
     help="Custom project name (default: directory name)",
 )
@@ -324,7 +322,7 @@ def parse(
     \b
     Examples:
         fuzz-generator parse -p ./src
-        fuzz-generator parse -p ./src -n my_project -l c
+        fuzz-generator parse -p ./src -pn my_project -l c
     """
     from fuzz_generator.cli.runner import AnalysisRunner
 
@@ -354,7 +352,7 @@ def parse(
 @cli.command()
 @click.option(
     "--task-id",
-    "-t",
+    "-i",
     type=str,
     help="View results for specific task",
 )
@@ -374,7 +372,7 @@ def parse(
 )
 @click.option(
     "--format",
-    "-f",
+    "--fmt",
     type=click.Choice(["table", "json", "yaml"]),
     default="table",
     help="Output format",
@@ -392,8 +390,8 @@ def results(
     \b
     Examples:
         fuzz-generator results --list
-        fuzz-generator results -t task_001
-        fuzz-generator results -b batch_001 -f json
+        fuzz-generator results -i task_001
+        fuzz-generator results -b batch_001 --fmt json
     """
     import json as json_lib
 
@@ -480,22 +478,23 @@ def results(
 )
 @click.option(
     "--task-id",
-    "-t",
+    "-i",
     type=str,
     help="Clear data for specific task",
 )
 @click.option(
     "--cache-only",
+    "-c",
     is_flag=True,
     default=False,
     help="Only clear analysis cache",
 )
 @click.option(
     "--force",
-    "-f",
+    "-y",
     is_flag=True,
     default=False,
-    help="Skip confirmation prompt",
+    help="Skip confirmation prompt (yes to all)",
 )
 @click.pass_context
 def clean(
@@ -509,9 +508,9 @@ def clean(
 
     \b
     Examples:
-        fuzz-generator clean --all
-        fuzz-generator clean -t task_001
-        fuzz-generator clean --cache-only
+        fuzz-generator clean --all -y
+        fuzz-generator clean -i task_001
+        fuzz-generator clean -c
     """
     from fuzz_generator.cli.runner import CacheCleaner
     from fuzz_generator.storage import JsonStorage
@@ -633,7 +632,6 @@ def status(ctx: click.Context) -> None:
     Displays information about:
     - Current configuration
     - MCP server connection status
-    - Running tasks
     - Cache statistics
     """
     from fuzz_generator.storage import JsonStorage

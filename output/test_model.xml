@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<Secray>
-<DataModel name="process_requestModel">
-  <Number name="length" size="32" signed="true"/>
-  <String name="buffer" maxLength="255"/>
-</DataModel>
-</Secray>
