@@ -170,12 +170,15 @@ MODEL_COMPLETE
 # ============================================================================
 
 
-def create_analysis_tools(mcp_client: MCPHttpClient, project_name: str) -> list:
+def create_analysis_tools(
+    mcp_client: MCPHttpClient, project_name: str, source_file: str | None = None
+) -> list:
     """Create all analysis tool functions for AnalysisAgent.
 
     Args:
         mcp_client: MCP HTTP client instance
         project_name: Active project name in Joern
+        source_file: Optional source file to narrow function search
 
     Returns:
         List of tool functions
@@ -192,10 +195,11 @@ def create_analysis_tools(mcp_client: MCPHttpClient, project_name: str) -> list:
         """
         from fuzz_generator.tools.query_tools import get_function_code as _get_func
 
-        # Note: query_tools.get_function_code signature is (client, function_name, project_name)
-        result = await _get_func(mcp_client, function_name, project_name)
+        # Pass source_file to narrow search if specified
+        result = await _get_func(mcp_client, function_name, project_name, file_name=source_file)
         if result.success:
-            return f"函数 {function_name} 的源代码:\n{result.code}"
+            file_info = f" (from {result.file})" if result.file else ""
+            return f"函数 {function_name} 的源代码{file_info}:\n{result.code}"
         return f"Error: {result.error}"
 
     async def list_functions(file_path: str | None = None) -> str:
@@ -520,8 +524,8 @@ class TwoPhaseWorkflow:
             timeout=settings.llm.timeout,
         )
 
-        # Create tools
-        self.tools = create_analysis_tools(mcp_client, project_name)
+        # Tools will be created in _run_analysis_phase with task-specific source_file
+        # self.tools = create_analysis_tools(mcp_client, project_name)
 
         # Conversation recorder
         self.recorder = ConversationRecorder(storage_path)
@@ -626,12 +630,17 @@ class TwoPhaseWorkflow:
         # Get prompt
         system_prompt = self._get_prompt("analysis_agent", DEFAULT_ANALYSIS_AGENT_PROMPT)
 
+        # Create tools with task-specific source_file for precise function lookup
+        tools = create_analysis_tools(
+            self.mcp_client, self.project_name, source_file=task.source_file
+        )
+
         # Create AnalysisAgent with all tools
         analysis_agent = AssistantAgent(
             name="AnalysisAgent",
             model_client=self.model_client,
             system_message=system_prompt,
-            tools=self.tools,
+            tools=tools,
             description="负责分析代码结构、数据流和控制流",
         )
 
