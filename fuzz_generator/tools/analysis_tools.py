@@ -237,8 +237,6 @@ async def track_dataflow(
     project_name: str,
     source_method: str | None = None,
     sink_method: str | None = None,
-    source_pattern: str | None = None,
-    sink_pattern: str | None = None,
 ) -> DataFlowResult:
     """Track data flow between source and sink.
 
@@ -257,8 +255,8 @@ async def track_dataflow(
         MCPToolError: If the tool call fails
     """
     logger.info(f"Tracking dataflow in project: {project_name}")
-    logger.debug(f"Source: {source_method or source_pattern}")
-    logger.debug(f"Sink: {sink_method or sink_pattern}")
+    logger.debug(f"Source: {source_method}")
+    logger.debug(f"Sink: {sink_method}")
 
     arguments: dict[str, Any] = {"project_name": project_name}
 
@@ -266,10 +264,6 @@ async def track_dataflow(
         arguments["source_method"] = source_method
     if sink_method:
         arguments["sink_method"] = sink_method
-    if source_pattern:
-        arguments["source_pattern"] = source_pattern
-    if sink_pattern:
-        arguments["sink_pattern"] = sink_pattern
 
     try:
         result = await client.call_tool("track_dataflow", arguments)
@@ -581,7 +575,7 @@ async def analyze_variable_flow(
             "analyze_variable_flow",
             {
                 "project_name": project_name,
-                "function_name": function_name,
+                "sink_method": function_name,
                 "variable_name": variable_name,
             },
         )
